@@ -1,0 +1,11 @@
+THEREST/
+venv/
+__pycache__/
+preprocess_cache_*/
+results_*/
+
+*.out
+*.err
+*.sif
+*.csv
+*.zip

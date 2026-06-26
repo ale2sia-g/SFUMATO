@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""Run preprocessing followed by GPU BGM from one shared config."""
+
+from __future__ import annotations
+
+import argparse
+
+from bgm_gpu_step_svd import run_bgm
+from preprocess_svd import run_preprocess
+from utils_config import load_config
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True, help="Path to JSON/YAML config.")
+    parser.add_argument(
+        "--force-preprocess",
+        action="store_true",
+        help="Overwrite an existing preprocessing cache.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    config = load_config(args.config)
+    run_preprocess(config, force=args.force_preprocess)
+    run_bgm(config)
+
+
+if __name__ == "__main__":
+    main()

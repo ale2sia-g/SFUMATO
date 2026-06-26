@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""GPU BGM clustering on sparse-SVD preprocessed data."""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import os
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+import numpy as np
+import pandas as pd
+
+from scipy.cluster.hierarchy import fcluster, linkage
+from sklearn.decomposition import PCA
+
+from bgm_pure_torch_lb import BayesianGaussianMixtureTorch
+from utils_bgm import (
+    BGMConfig,
+    bgm_stem_for,
+    cache_file_for,
+    centroids_to_hsv_rgb,
+    color_mix_top2_log,
+    csv_to_h5ad,
+    get_p2r_from_cache,
+    image_dir_for,
+    merge_centroids_by_groups,
+    merge_probabilities_from_labels,
+    normalize_condensed,
+    plot_final_dendrogram_with_colors,
+    plot_oversampled_dendrogram,
+    result_dir_for,
+    rgb01_to_hex,
+    safe_cosine_pdist,
+    save_json,
+    soft_cluster_centroids,
+    top2_from_proba,
+)
+from utils_config import load_config
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True, help="Path to JSON/YAML config.")
+    return parser.parse_args()
+
+
+def run_bgm(config: dict) -> None:
+    import torch
+
+    print(f"CUDA available: {torch.cuda.is_available()}", flush=True)
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
+    else:
+        raise SystemExit("CUDA is required for bgm_gpu_step_svd.py")
+
+    cfg = BGMConfig.from_dict(config)
+    if not cfg.use_svd:
+        raise ValueError("Only sparse TruncatedSVD mode is currently supported.")
+    if cfg.merge_metric != "cosine":
+        raise ValueError("Only merge_metric='cosine' is currently implemented.")
+
+    cache_file = cache_file_for(cfg)
+    if not cache_file.exists():
+        raise FileNotFoundError(f"Cache not found: {cache_file}. Run preprocess first.")
+
+    print(f"Loading cache from {cache_file}...", flush=True)
+    data = np.load(cache_file, allow_pickle=True)
+    X_norm = data["X_norm"]
+    X_rare = data["X_rare"]
+    good_bin_ids = data["good_bin_ids"]
+    pos = data["pos"]
+    back_map = data["back_map"]
+    gene_x = data["gene_x"]
+    gene_y = data["gene_y"]
+    gene_name = data["gene_name"]
+    gene_bin_id = data["gene_bin_id"]
+
+    print(f"  X_norm: {X_norm.shape}", flush=True)
+    print(f"  X_rare: {X_rare.shape}", flush=True)
+
+    df_run = pd.DataFrame(
+        {
+            "x": gene_x,
+            "y": gene_y,
+            "target_name": gene_name,
+            "bin_id": gene_bin_id,
+        }
+    )
+
+    for k in cfg.k_list:
+        k = int(k)
+        k_bgm = int(np.ceil(cfg.bgm_oversample * k))
+        oversample = cfg.bgm_oversample > 1.0
+        stem = bgm_stem_for(cfg, k)
+        outdir = result_dir_for(cfg, k)
+        image_dir = image_dir_for(cfg, k)
+        outdir.mkdir(parents=True, exist_ok=True)
+        image_dir.mkdir(parents=True, exist_ok=True)
+
+        outfile_h5ad = outdir / f"{stem}_FULL.h5ad"
+        outfile_bins = outdir / f"{stem}_binlevel_FULL.csv"
+        outfile_proba = outdir / f"{stem}_transcripts_proba_FULL.csv"
+
+        print(f"\n{'=' * 60}", flush=True)
+        print(f"K={k}, K_bgm={k_bgm}, oversample={oversample}", flush=True)
+        print(f"Output directory: {outdir}", flush=True)
+
+        has_p2r = cfg.save_p2r
+        if has_p2r:
+            cluster_p2r_bins, p2r_color_bins = get_p2r_from_cache(data, k)
+
+        print(f"BGM ({k_bgm} components, {X_norm.shape[1]} dims)...", flush=True)
+        bgm = BayesianGaussianMixtureTorch(
+            n_components=k_bgm,
+            n_init=1,
+            init_params="k-means++",
+            covariance_type="diag",
+            weight_concentration_prior_type="dirichlet_process",
+            weight_concentration_prior=cfg.bgm_weight_prior,
+            random_state=cfg.seed,
+            max_iter=1000,
+            verbose=1,
+            verbose_interval=10,
+            tol=1e-2,
+            batch_size=None,
+            device="cuda",
+        )
+        bgm.fit(X_norm)
+        proba = bgm.predict_proba(X_norm)
+
+        centroids_soft, masses = soft_cluster_centroids(X_norm, proba)
+        centroids_rare_soft, _ = soft_cluster_centroids(X_rare, proba)
+        centroids_for_merge = centroids_soft
+        centroids_rare_for_merge = centroids_rare_soft
+        print("  Using soft centroids", flush=True)
+
+        Z_link = None
+        if oversample:
+            print(f"Merging {proba.shape[1]} -> {k} clusters...", flush=True)
+
+            d_all = normalize_condensed(safe_cosine_pdist(centroids_for_merge))
+
+            # TODO: complete rare-gene distance contribution before enabling this.
+            # d_rare = normalize_condensed(safe_cosine_pdist(centroids_rare_for_merge))
+            # d_comb = d_all + cfg.beta_rare * d_rare
+
+            d_comb = d_all
+            Z_link = linkage(d_comb, method=cfg.merge_method)
+
+            plot_oversampled_dendrogram(
+                Z_link,
+                target_k=k,
+                path=image_dir / f"{stem}_oversampled_dendrogram_cut.png",
+                title=f"{stem}: oversampled BGM dendrogram cut to K={k}",
+            )
+
+            merge_labels = fcluster(Z_link, t=k, criterion="maxclust")
+            proba, groups = merge_probabilities_from_labels(proba, merge_labels)
+            centroids_for_merge, masses = merge_centroids_by_groups(
+                centroids_for_merge, masses, groups
+            )
+            print(f"  Final clusters: {proba.shape[1]}", flush=True)
+
+        print("PCA on final cluster centroids for colors...", flush=True)
+        pca_color = PCA(n_components=3, random_state=cfg.seed)
+        pca_color.fit(centroids_for_merge)
+
+        X_pca_color = pca_color.transform(X_norm)
+        means_3d = pca_color.transform(centroids_for_merge)
+        print(f"  Explained variance: {pca_color.explained_variance_ratio_.sum():.3f}", flush=True)
+
+        cluster, second_cluster, p1, p2 = top2_from_proba(proba)
+        rgb, hue, h_shifted, h_new = centroids_to_hsv_rgb(
+            means_3d,
+            use_hist_equalization=cfg.use_hist_equalization,
+            return_hues=True,
+        )
+        centroid_colors = [rgb[i] for i in range(rgb.shape[0])]
+
+        plot_final_dendrogram_with_colors(
+            centroids_for_merge,
+            centroid_colors,
+            image_dir / f"{stem}_final_dendrogram_colors.png",
+            title=f"{stem}: final cluster dendrogram with assigned colors",
+            method=cfg.merge_method,
+        )
+
+        df_bins = pd.DataFrame(
+            {
+                "bin_id": good_bin_ids,
+                "x": pos[:, 0],
+                "y": pos[:, 1],
+                "cluster": cluster,
+                "second_cluster": second_cluster,
+                "p1": p1,
+                "p2": p2,
+                "compl_p1": 1 - p1,
+                "PC1": X_pca_color[:, 0],
+                "PC2": X_pca_color[:, 1],
+                "PC3": X_pca_color[:, 2],
+            }
+        )
+        df_bins["color_hard_hsv"] = df_bins["cluster"].apply(
+            lambda c: rgb01_to_hex(centroid_colors[c])
+        )
+        df_bins["color_log_hsv"] = df_bins.apply(
+            lambda row: color_mix_top2_log(
+                centroid_colors[row["cluster"]],
+                centroid_colors[row["second_cluster"]],
+                row["p1"],
+                row["p2"],
+                alpha=50.0,
+            ),
+            axis=1,
+        )
+
+        if has_p2r:
+            df_bins["color_p2r"] = p2r_color_bins[good_bin_ids]
+            df_bins["cluster_p2r"] = cluster_p2r_bins[good_bin_ids]
+
+        df_mappedback = df_run[["x", "y", "target_name", "bin_id"]].copy()
+        df_mappedback = df_mappedback.merge(
+            df_bins[
+                [
+                    "bin_id",
+                    "cluster",
+                    "color_hard_hsv",
+                    "color_log_hsv",
+                    "compl_p1",
+                    "PC1",
+                    "PC2",
+                    "PC3",
+                ]
+            ],
+            on="bin_id",
+            how="left",
+        )
+        df_mappedback["cluster"] = (
+            df_mappedback["cluster"].fillna(-1).astype(int).astype("category")
+        )
+
+        if has_p2r:
+            cluster_p2r_transcripts = cluster_p2r_bins[back_map]
+            df_mappedback["cluster_p2r"] = cluster_p2r_transcripts
+            df_mappedback["cluster_p2r"] = df_mappedback["cluster_p2r"].astype("category")
+            df_mappedback["color_p2r"] = p2r_color_bins[back_map]
+
+        df_colors = pd.DataFrame(
+            {
+                "cluster": np.arange(len(hue)),
+                "hue_raw": hue,
+                "hue_rotated": h_shifted,
+                "hue_equalized": h_new,
+                "color_hex": [rgb01_to_hex(c) for c in rgb],
+            }
+        )
+
+        hues_file = outdir / f"hues_{stem}.csv"
+        df_colors.to_csv(hues_file, index=False)
+        print(f"  Saved {hues_file}", flush=True)
+
+        adata_output = csv_to_h5ad(df_mappedback)
+        adata_output.write_h5ad(outfile_h5ad)
+        print(f"  Saved {outfile_h5ad}", flush=True)
+
+        df_bins.to_csv(outfile_bins, index=False)
+        print(f"  Saved {outfile_bins}", flush=True)
+
+        weights_file = outdir / f"weights_{stem}.txt"
+        with weights_file.open("w", encoding="utf-8") as f:
+            f.write(f"K={k}, K_bgm={k_bgm}\n")
+            f.write("BGM weights:\n")
+            for i, weight in enumerate(bgm.weights_):
+                f.write(f"Component {i}: {weight}\n")
+            f.write("\nCluster masses:\n")
+            for j, mass in enumerate(masses):
+                f.write(f"Cluster {j}: {mass}\n")
+        print(f"  Saved {weights_file}", flush=True)
+
+        if cfg.save_transcript_proba:
+            print("Saving transcript-level probability CSV...", flush=True)
+            n_clusters_final = proba.shape[1]
+            transcript_bin_ids = df_run["bin_id"].to_numpy()
+            n_bins_total = (
+                int(data["n_bins_total"][0])
+                if "n_bins_total" in data
+                else int(transcript_bin_ids.max()) + 1
+            )
+            bin_id_to_row = np.full(n_bins_total, -1, dtype=np.int32)
+            bin_id_to_row[good_bin_ids] = np.arange(len(good_bin_ids), dtype=np.int32)
+            transcript_proba_rows = bin_id_to_row[transcript_bin_ids]
+
+            proba_transcripts = np.zeros(
+                (len(df_run), n_clusters_final), dtype=np.float32
+            )
+            valid_mask = transcript_proba_rows >= 0
+            proba_transcripts[valid_mask] = proba[
+                transcript_proba_rows[valid_mask]
+            ].astype(np.float32)
+
+            df_proba = pd.DataFrame(
+                {
+                    "x": gene_x.astype(np.int32),
+                    "y": gene_y.astype(np.int32),
+                    "target_name": gene_name,
+                    "bin_id": transcript_bin_ids.astype(np.int32),
+                    "color_hard_hsv": df_mappedback["color_hard_hsv"].to_numpy(),
+                    "color_log_hsv": df_mappedback["color_log_hsv"].to_numpy(),
+                }
+            )
+            for cluster_idx in range(n_clusters_final):
+                df_proba[f"p{cluster_idx + 1}"] = proba_transcripts[:, cluster_idx]
+
+            df_proba.to_csv(outfile_proba, index=False)
+            print(
+                f"  Saved {outfile_proba} - {len(df_proba):,} transcripts, "
+                f"{n_clusters_final} clusters",
+                flush=True,
+            )
+            del df_proba, proba_transcripts, bin_id_to_row, transcript_proba_rows
+            gc.collect()
+        else:
+            print("  Skipped transcript-level probability CSV.", flush=True)
+
+        save_json(
+            outdir / f"{stem}_bgm_config.json",
+            {
+                "run_name": cfg.run_name,
+                "K": k,
+                "K_bgm": k_bgm,
+                "cache_file": str(cache_file),
+                "output_directory": str(outdir),
+                "bgm": config.get("bgm", {}),
+                "preprocess": config.get("preprocess", {}),
+                "save_transcript_proba": cfg.save_transcript_proba,
+            },
+        )
+
+        del bgm, proba, centroids_soft, centroids_rare_soft
+        del centroids_for_merge, centroids_rare_for_merge, masses
+        del pca_color, X_pca_color, means_3d
+        del cluster, second_cluster, p1, p2, rgb, hue, h_shifted, h_new
+        del centroid_colors, df_bins, df_mappedback, df_colors, adata_output
+        if Z_link is not None:
+            del Z_link
+        gc.collect()
+        print(f"  Done K={k}", flush=True)
+
+    del data, X_norm, X_rare, good_bin_ids, pos, back_map
+    del gene_x, gene_y, gene_name, gene_bin_id, df_run
+    gc.collect()
+
+
+def main() -> None:
+    args = parse_args()
+    config = load_config(args.config)
+    run_bgm(config)
+
+
+if __name__ == "__main__":
+    main()

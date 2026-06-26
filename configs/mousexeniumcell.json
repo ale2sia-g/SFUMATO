@@ -1,0 +1,41 @@
+{
+  "run_name": "mousexeniumcell",
+  "input_csv": "xenium_mouse.csv",
+  "columns": {
+    "x": "x",
+    "y": "y",
+    "gene": "target_name",
+    "num_id": "num_id"
+  },
+  "preprocess": {
+    "k_list": [30, 40, 45],
+    "bgm_oversample": 1.5,
+    "min_genes_per_bin": 4,
+    "bin_width": 5,
+    "factor": 4,
+    "seed": 8,
+    "use_svd": true,
+    "comp": 10,
+    "save_p2r": true,
+    "alpha": 1.0,
+    "rare_genes": null,
+    "cache_dir": "preprocess_cache_mousexeniumcell_svd"
+  },
+  "bgm": {
+    "outroot": "results_mousexeniumcell_svd",
+    "save_transcript_proba": false,
+    "beta_rare": 0.0,
+    "merge_method": "complete",
+    "merge_metric": "cosine",
+    "bgm_weight_prior": 1,
+    "use_hist_equalization": true
+  },
+  "umap": {
+    "run": false,
+    "max_points": 200000,
+    "umap_components": 3,
+    "n_neighbors": 30,
+    "min_dist": 0.15,
+    "point_size": 0.35
+  }
+}

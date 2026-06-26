@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CPU preprocessing pipeline with sparse TruncatedSVD.
+"""CPU preprocessing pipeline
 
 This script is dataset-agnostic. All run-specific values are read from a
 shared config file so the same config can be used by the CPU preprocessing

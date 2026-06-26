@@ -15,4 +15,4 @@ CONFIG=/workspace/configs/mousexeniumniche_diffseed.json
 apptainer exec --nv \
     --bind ${WORKDIR}:/workspace \
     ${IMAGE} \
-    bash -lc "cd /workspace && python -u /workspace/bgm_gpu_step_svd.py --config ${CONFIG}"
+    bash -lc "cd /workspace && python -u /workspace/run_bgm_gpu.py --config ${CONFIG}"

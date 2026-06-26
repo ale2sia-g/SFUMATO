@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import argparse
 
-from bgm_gpu_step_svd import run_bgm
-from preprocess_svd import run_preprocess
+from run_bgm_gpu import run_bgm
+from preprocess import run_preprocess
 from utils_config import load_config
 
 

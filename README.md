@@ -22,7 +22,7 @@ The same config file is used for local runs, separate preprocessing/BGM runs, an
 
 ## Main Config
 
-Example for Niche level Xenium Mousebrain:
+Example for niche-level Xenium Mouse Brain:
 
 ```bash
 configs/mousexeniumniche.json
@@ -38,7 +38,7 @@ Example run settings:
 - `bin_width`: `40`
 - `factor`: `8`
 - `seed`: `8`
-- `comp`: `10` 
+- `comp`: `10`
 - `save_p2r`: `true`
 - `save_transcript_proba`: `false`
 
@@ -47,14 +47,14 @@ Example run settings:
 Run preprocessing and BGM in one command:
 
 ```bash
-python run_pipeline.py --config configs/mousexeniumniche.json
+python run_sfumato.py --config configs/mousexeniumniche.json
 ```
 
 Or run the two steps separately:
 
 ```bash
-python preprocess_svd.py --config configs/mousexeniumniche.json
-python bgm_gpu_step_svd.py --config configs/mousexeniumniche.json
+python preprocess.py --config configs/mousexeniumniche.json
+python run_bgm_gpu.py --config configs/mousexeniumniche.json
 ```
 
 ## Alvis / SLURM
@@ -62,19 +62,19 @@ python bgm_gpu_step_svd.py --config configs/mousexeniumniche.json
 Submit preprocessing and BGM as separate jobs with dependency:
 
 ```bash
-bash sbatch/submit_svd_pipeline.sh
+bash sbatch/submit_pipeline.sh
 ```
 
 The preprocessing job uses:
 
 ```bash
-sbatch/preprocess_svd.sbatch
+sbatch/preprocess.sbatch
 ```
 
 The GPU job uses:
 
 ```bash
-sbatch/bgm_gpu_step_svd.sbatch
+sbatch/run_bgm_gpu.sbatch
 ```
 
 ## Outputs

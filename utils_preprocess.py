@@ -38,6 +38,7 @@ class PreprocessConfig:
     factor: int
     seed: int
     use_svd: bool
+    use_pca: bool
     comp: int
     save_p2r: bool
     cache_dir: Path
@@ -48,6 +49,12 @@ class PreprocessConfig:
     def from_dict(cls, config: dict[str, Any]) -> "PreprocessConfig":
         columns = config.get("columns", {})
         preprocess = config.get("preprocess", {})
+
+        use_svd = bool(preprocess.get("use_svd", True))
+        use_pca = bool(preprocess.get("use_pca", False))
+        if not use_svd and not use_pca:
+            raise ValueError("At least one of preprocess.use_svd or preprocess.use_pca must be true.")
+
         return cls(
             run_name=config["run_name"],
             input_csv=resolve_path(config, config["input_csv"]),
@@ -61,7 +68,8 @@ class PreprocessConfig:
             bin_width=int(preprocess["bin_width"]),
             factor=int(preprocess["factor"]),
             seed=int(preprocess.get("seed", 8)),
-            use_svd=bool(preprocess.get("use_svd", True)),
+            use_svd=use_svd,
+            use_pca=use_pca,
             comp=int(preprocess["comp"]),
             save_p2r=bool(preprocess.get("save_p2r", True)),
             cache_dir=resolve_path(config, preprocess["cache_dir"]),
@@ -93,7 +101,7 @@ def validate_and_standardize_dataframe(df: pd.DataFrame, cfg: PreprocessConfig) 
 
 
 def resolve_rare_genes(df: pd.DataFrame, rare_genes: Any | None) -> list[str]:
-    # TODO: support user-provided rare-gene dictionaries.
+    # TODO: replace flat rare-gene handling with marker-group dictionaries.
     if isinstance(rare_genes, dict) and rare_genes:
         flattened: list[str] = []
         for value in rare_genes.values():
@@ -150,6 +158,56 @@ def tsne_colors_p2r(cluster_centers: np.ndarray, seed: int = 42) -> list[str]:
     return [rgb01_to_hex(c) for c in colors_rgb]
 
 
+def reduction_methods_from_config(cfg: PreprocessConfig) -> list[str]:
+    methods: list[str] = []
+    if cfg.use_svd:
+        methods.append("svd")
+    if cfg.use_pca:
+        methods.append("pca")
+    if not methods:
+        raise ValueError("At least one reduction method must be enabled.")
+    return methods
+
+
+def method_label(method: str) -> str:
+    method = method.lower()
+    if method == "svd":
+        return "SVD"
+    if method == "pca":
+        return "PCA"
+    raise ValueError(f"Unknown reduction method: {method}")
+
+
+def method_uses_svd(method: str) -> bool:
+    method = method.lower()
+    if method == "svd":
+        return True
+    if method == "pca":
+        return False
+    raise ValueError(f"Unknown reduction method: {method}")
+
+
+def method_cache_dir(base_cache_dir: Path, method: str) -> Path:
+    """
+    Return a method-specific cache directory.
+
+    If base_cache_dir already ends with _svd or _pca, replace that suffix.
+    Otherwise append _svd or _pca.
+    """
+    method = method.lower()
+    if method not in {"svd", "pca"}:
+        raise ValueError(f"Unknown reduction method: {method}")
+
+    name = base_cache_dir.name
+    lower_name = name.lower()
+
+    if lower_name.endswith("_svd") or lower_name.endswith("_pca"):
+        prefix = name[:-4]
+        return base_cache_dir.parent / f"{prefix}_{method}"
+
+    return base_cache_dir.parent / f"{name}_{method}"
+
+
 def make_preprocess_stem(
     run_name: str,
     bin_width: int,
@@ -157,7 +215,7 @@ def make_preprocess_stem(
     comp: int,
     use_svd: bool,
 ) -> str:
-    dim_tag = f"_SVD{comp}" if use_svd else "_noSVD"
+    dim_tag = f"_SVD{comp}" if use_svd else f"_PCA{comp}"
     return f"{run_name}_BIN{bin_width}_F{factor}{dim_tag}"
 
 
@@ -171,7 +229,7 @@ def make_bgm_stem(
     use_svd: bool,
     bgm_oversample: float,
 ) -> str:
-    dim_tag = f"_SVD{comp}" if use_svd else "_noSVD"
+    dim_tag = f"_SVD{comp}" if use_svd else f"_PCA{comp}"
     if bgm_oversample > 1.0:
         return f"{run_name}_BGM{k_bgm}to{k}_BIN{bin_width}_F{factor}{dim_tag}"
     return f"{run_name}_BGM{k_bgm}_BIN{bin_width}_F{factor}{dim_tag}"

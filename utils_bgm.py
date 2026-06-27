@@ -16,7 +16,14 @@ from scipy.spatial.distance import pdist
 from sklearn.preprocessing import normalize as sk_normalize
 
 from utils_config import default_results_dir, resolve_path
-from utils_preprocess import make_bgm_stem, make_preprocess_stem, p2r_cache_keys
+from utils_preprocess import (
+    make_bgm_stem,
+    make_preprocess_stem,
+    method_cache_dir,
+    method_label,
+    method_uses_svd,
+    p2r_cache_keys,
+)
 
 
 @dataclass(frozen=True)
@@ -28,6 +35,7 @@ class BGMConfig:
     factor: int
     seed: int
     use_svd: bool
+    use_pca: bool
     comp: int
     save_p2r: bool
     cache_dir: Path
@@ -43,9 +51,20 @@ class BGMConfig:
     def from_dict(cls, config: dict[str, Any]) -> "BGMConfig":
         preprocess = config.get("preprocess", {})
         bgm = config.get("bgm", {})
+
+        use_svd = bool(preprocess.get("use_svd", True))
+        use_pca = bool(preprocess.get("use_pca", False))
+        if not use_svd and not use_pca:
+            raise ValueError("At least one of preprocess.use_svd or preprocess.use_pca must be true.")
+
         cache_dir = resolve_path(config, preprocess["cache_dir"])
         outroot_value = bgm.get("outroot")
-        outroot = resolve_path(config, outroot_value) if outroot_value else default_results_dir(cache_dir)
+        outroot = (
+            resolve_path(config, outroot_value)
+            if outroot_value
+            else default_results_dir(cache_dir)
+        )
+
         return cls(
             run_name=config["run_name"],
             k_list=[int(k) for k in preprocess["k_list"]],
@@ -53,7 +72,8 @@ class BGMConfig:
             bin_width=int(preprocess["bin_width"]),
             factor=int(preprocess["factor"]),
             seed=int(preprocess.get("seed", 8)),
-            use_svd=bool(preprocess.get("use_svd", True)),
+            use_svd=use_svd,
+            use_pca=use_pca,
             comp=int(preprocess["comp"]),
             save_p2r=bool(preprocess.get("save_p2r", True)),
             cache_dir=cache_dir,
@@ -67,22 +87,58 @@ class BGMConfig:
         )
 
 
-def result_dir_for(cfg: BGMConfig, k: int) -> Path:
-    return cfg.outroot / f"K{k}" / f"SVD{cfg.comp}"
+def bgm_methods_from_config(cfg: BGMConfig) -> list[str]:
+    methods: list[str] = []
+    if cfg.use_svd:
+        methods.append("svd")
+    if cfg.use_pca:
+        methods.append("pca")
+    if not methods:
+        raise ValueError("At least one BGM reduction method must be enabled.")
+    return methods
 
 
-def image_dir_for(cfg: BGMConfig, k: int) -> Path:
-    return result_dir_for(cfg, k) / "images"
+def method_outroot(base_outroot: Path, method: str) -> Path:
+    """
+    Return a method-specific result directory.
+
+    If base_outroot already ends with _svd or _pca, replace that suffix.
+    Otherwise append _svd or _pca.
+    """
+    method = method.lower()
+    if method not in {"svd", "pca"}:
+        raise ValueError(f"Unknown reduction method: {method}")
+
+    name = base_outroot.name
+    lower_name = name.lower()
+
+    if lower_name.endswith("_svd") or lower_name.endswith("_pca"):
+        prefix = name[:-4]
+        return base_outroot.parent / f"{prefix}_{method}"
+
+    return base_outroot.parent / f"{name}_{method}"
 
 
-def cache_file_for(cfg: BGMConfig) -> Path:
+def result_dir_for(cfg: BGMConfig, k: int, method: str) -> Path:
+    return method_outroot(cfg.outroot, method) / f"K{k}" / f"{method_label(method)}{cfg.comp}"
+
+
+def image_dir_for(cfg: BGMConfig, k: int, method: str) -> Path:
+    return result_dir_for(cfg, k, method) / "images"
+
+
+def cache_file_for(cfg: BGMConfig, method: str) -> Path:
     stem = make_preprocess_stem(
-        cfg.run_name, cfg.bin_width, cfg.factor, cfg.comp, cfg.use_svd
+        cfg.run_name,
+        cfg.bin_width,
+        cfg.factor,
+        cfg.comp,
+        method_uses_svd(method),
     )
-    return cfg.cache_dir / f"{stem}.npz"
+    return method_cache_dir(cfg.cache_dir, method) / f"{stem}.npz"
 
 
-def bgm_stem_for(cfg: BGMConfig, k: int) -> str:
+def bgm_stem_for(cfg: BGMConfig, k: int, method: str) -> str:
     k_bgm = int(np.ceil(cfg.bgm_oversample * k))
     return make_bgm_stem(
         cfg.run_name,
@@ -91,7 +147,7 @@ def bgm_stem_for(cfg: BGMConfig, k: int) -> str:
         cfg.bin_width,
         cfg.factor,
         cfg.comp,
-        cfg.use_svd,
+        method_uses_svd(method),
         cfg.bgm_oversample,
     )
 

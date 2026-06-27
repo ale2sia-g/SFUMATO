@@ -15,14 +15,15 @@
     "factor": 8,
     "seed": 47,
     "use_svd": true,
+    "use_pca": true,
     "comp": 10,
     "save_p2r": true,
     "alpha": 1.0,
     "rare_genes": null,
-    "cache_dir": "preprocess_cache_mousexeniumniche_diffseed_svd"
+    "cache_dir": "preprocess_cache_mousexeniumniche_diffseed"
   },
   "bgm": {
-    "outroot": "results_mousexeniumniche_diffseed_svd",
+    "outroot": "results_mousexeniumniche_diffseed",
     "save_transcript_proba": false,
     "beta_rare": 0.0,
     "merge_method": "complete",

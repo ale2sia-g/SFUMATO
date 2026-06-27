@@ -1,4 +1,4 @@
-"""Configuration loading helpers for the SVD/BGM pipeline.
+"""Configuration loading helpers for the SFUMATO pipeline.
 
 JSON is the recommended format because it needs no third-party dependency.
 YAML is supported only when PyYAML is available in the execution environment.
@@ -61,11 +61,15 @@ def require_section(config: dict[str, Any], section: str) -> dict[str, Any]:
     return value
 
 
-def get_path(config: dict[str, Any], key: str, default: str | None = None) -> Path:
+def get_path(
+    config: dict[str, Any],
+    key: str,
+    default: str | Path | None = None,
+) -> Path:
     value = config.get(key, default)
     if value is None:
         raise ValueError(f"Missing required path config value: {key}")
-    return Path(value)
+    return resolve_path(config, value)
 
 
 def default_results_dir(cache_dir: str | Path) -> Path:

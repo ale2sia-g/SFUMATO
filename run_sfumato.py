@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Run preprocessing followed by GPU BGM from one shared config."""
+"""Run SFUMATO preprocessing followed by GPU BGM from one shared config.
+
+If preprocess.use_svd and preprocess.use_pca are both true, preprocessing
+creates both caches and BGM runs on both embeddings.
+"""
 
 from __future__ import annotations
 
 import argparse
 
-from run_bgm_gpu import run_bgm
 from preprocess import run_preprocess
+from run_bgm_gpu import run_bgm
 from utils_config import load_config
 
 
@@ -16,7 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--force-preprocess",
         action="store_true",
-        help="Overwrite an existing preprocessing cache.",
+        help="Overwrite existing preprocessing caches.",
     )
     return parser.parse_args()
 

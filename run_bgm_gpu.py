@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPU BGM clustering on sparse-SVD preprocessed data."""
+"""GPU BGM clustering on preprocessed SFUMATO embeddings."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from sklearn.decomposition import PCA
 from bgm_pure_torch_lb import BayesianGaussianMixtureTorch
 from utils_bgm import (
     BGMConfig,
+    bgm_methods_from_config,
     bgm_stem_for,
     cache_file_for,
     centroids_to_hsv_rgb,
@@ -47,39 +48,48 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_bgm(config: dict) -> None:
-    import torch
-
-    print(f"CUDA available: {torch.cuda.is_available()}", flush=True)
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
-    else:
-        raise SystemExit("CUDA is required for bgm_gpu_step_svd.py")
-
-    cfg = BGMConfig.from_dict(config)
-    if not cfg.use_svd:
-        raise ValueError("Only sparse TruncatedSVD mode is currently supported.")
-    if cfg.merge_metric != "cosine":
-        raise ValueError("Only merge_metric='cosine' is currently implemented.")
-
-    cache_file = cache_file_for(cfg)
+def load_cache_for_method(cfg: BGMConfig, method: str):
+    cache_file = cache_file_for(cfg, method)
     if not cache_file.exists():
         raise FileNotFoundError(f"Cache not found: {cache_file}. Run preprocess first.")
 
-    print(f"Loading cache from {cache_file}...", flush=True)
+    print(f"Loading {method.upper()} cache from {cache_file}...", flush=True)
     data = np.load(cache_file, allow_pickle=True)
-    X_norm = data["X_norm"]
-    X_rare = data["X_rare"]
-    good_bin_ids = data["good_bin_ids"]
-    pos = data["pos"]
-    back_map = data["back_map"]
-    gene_x = data["gene_x"]
-    gene_y = data["gene_y"]
-    gene_name = data["gene_name"]
-    gene_bin_id = data["gene_bin_id"]
 
-    print(f"  X_norm: {X_norm.shape}", flush=True)
-    print(f"  X_rare: {X_rare.shape}", flush=True)
+    payload = {
+        "cache_file": cache_file,
+        "data": data,
+        "X_norm": data["X_norm"],
+        "X_rare": data["X_rare"],
+        "good_bin_ids": data["good_bin_ids"],
+        "pos": data["pos"],
+        "back_map": data["back_map"],
+        "gene_x": data["gene_x"],
+        "gene_y": data["gene_y"],
+        "gene_name": data["gene_name"],
+        "gene_bin_id": data["gene_bin_id"],
+    }
+
+    print(f"  X_norm: {payload['X_norm'].shape}", flush=True)
+    print(f"  X_rare: {payload['X_rare'].shape}", flush=True)
+
+    return payload
+
+
+def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
+    payload = load_cache_for_method(cfg, method)
+
+    cache_file = payload["cache_file"]
+    data = payload["data"]
+    X_norm = payload["X_norm"]
+    X_rare = payload["X_rare"]
+    good_bin_ids = payload["good_bin_ids"]
+    pos = payload["pos"]
+    back_map = payload["back_map"]
+    gene_x = payload["gene_x"]
+    gene_y = payload["gene_y"]
+    gene_name = payload["gene_name"]
+    gene_bin_id = payload["gene_bin_id"]
 
     df_run = pd.DataFrame(
         {
@@ -94,9 +104,9 @@ def run_bgm(config: dict) -> None:
         k = int(k)
         k_bgm = int(np.ceil(cfg.bgm_oversample * k))
         oversample = cfg.bgm_oversample > 1.0
-        stem = bgm_stem_for(cfg, k)
-        outdir = result_dir_for(cfg, k)
-        image_dir = image_dir_for(cfg, k)
+        stem = bgm_stem_for(cfg, k, method)
+        outdir = result_dir_for(cfg, k, method)
+        image_dir = image_dir_for(cfg, k, method)
         outdir.mkdir(parents=True, exist_ok=True)
         image_dir.mkdir(parents=True, exist_ok=True)
 
@@ -105,6 +115,7 @@ def run_bgm(config: dict) -> None:
         outfile_proba = outdir / f"{stem}_transcripts_proba_FULL.csv"
 
         print(f"\n{'=' * 60}", flush=True)
+        print(f"Reduction method={method.upper()}", flush=True)
         print(f"K={k}, K_bgm={k_bgm}, oversample={oversample}", flush=True)
         print(f"Output directory: {outdir}", flush=True)
 
@@ -170,7 +181,10 @@ def run_bgm(config: dict) -> None:
 
         X_pca_color = pca_color.transform(X_norm)
         means_3d = pca_color.transform(centroids_for_merge)
-        print(f"  Explained variance: {pca_color.explained_variance_ratio_.sum():.3f}", flush=True)
+        print(
+            f"  Explained variance: {pca_color.explained_variance_ratio_.sum():.3f}",
+            flush=True,
+        )
 
         cluster, second_cluster, p1, p2 = top2_from_proba(proba)
         rgb, hue, h_shifted, h_new = centroids_to_hsv_rgb(
@@ -271,6 +285,7 @@ def run_bgm(config: dict) -> None:
 
         weights_file = outdir / f"weights_{stem}.txt"
         with weights_file.open("w", encoding="utf-8") as f:
+            f.write(f"Reduction method={method.upper()}\n")
             f.write(f"K={k}, K_bgm={k_bgm}\n")
             f.write("BGM weights:\n")
             for i, weight in enumerate(bgm.weights_):
@@ -329,6 +344,7 @@ def run_bgm(config: dict) -> None:
             outdir / f"{stem}_bgm_config.json",
             {
                 "run_name": cfg.run_name,
+                "reduction_method": method.upper(),
                 "K": k,
                 "K_bgm": k_bgm,
                 "cache_file": str(cache_file),
@@ -347,11 +363,32 @@ def run_bgm(config: dict) -> None:
         if Z_link is not None:
             del Z_link
         gc.collect()
-        print(f"  Done K={k}", flush=True)
+        print(f"  Done {method.upper()} K={k}", flush=True)
 
+    data.close()
     del data, X_norm, X_rare, good_bin_ids, pos, back_map
     del gene_x, gene_y, gene_name, gene_bin_id, df_run
     gc.collect()
+
+
+def run_bgm(config: dict) -> None:
+    import torch
+
+    print(f"CUDA available: {torch.cuda.is_available()}", flush=True)
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
+    else:
+        raise SystemExit("CUDA is required for BGM.")
+
+    cfg = BGMConfig.from_dict(config)
+    if cfg.merge_metric != "cosine":
+        raise ValueError("Only merge_metric='cosine' is currently implemented.")
+
+    methods = bgm_methods_from_config(cfg)
+    print(f"Selected BGM reduction methods: {methods}", flush=True)
+
+    for method in methods:
+        run_bgm_for_method(config, cfg, method)
 
 
 def main() -> None:

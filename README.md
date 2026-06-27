@@ -18,7 +18,7 @@ SFUMATO is a Bayesian probabilistic clustering and visualisation pipeline for sp
 It uses spatial binning, dimensionality reduction, and Bayesian Gaussian mixture modelling to identify spatial niches while preserving uncertainty information and enabling interpretable colour-based visualisation.
 
 This pipeline separates dataset/run configuration from reusable method code.  
-The same config file is used for local runs, separate preprocessing/BGM runs, and Alvis SLURM jobs.
+The same config file is used for local runs, separate preprocessing/BGM runs, optional post-processing plots, and Alvis SLURM jobs.
 
 ## Main Config
 
@@ -38,9 +38,59 @@ Example run settings:
 - `bin_width`: `40`
 - `factor`: `8`
 - `seed`: `8`
+- `use_svd`: `true`
+- `use_pca`: `false`
 - `comp`: `10`
 - `save_p2r`: `true`
 - `save_transcript_proba`: `false`
+
+## Dimensionality Reduction
+
+SFUMATO supports sparse TruncatedSVD and dense PCA.
+
+Use SVD only:
+
+```json
+"use_svd": true,
+"use_pca": false
+```
+
+Use PCA only:
+
+```json
+"use_svd": false,
+"use_pca": true
+```
+
+Run both SVD and PCA from the same preprocessing step:
+
+```json
+"use_svd": true,
+"use_pca": true
+```
+
+When both are enabled, `points2regions_withsplit` is run once, then separate caches are written for each embedding method.
+
+Use a base cache/output name in the config:
+
+```json
+"cache_dir": "preprocess_cache_mousexeniumniche"
+```
+
+```json
+"outroot": "results_mousexeniumniche"
+```
+
+The code will create method-specific folders automatically:
+
+```text
+preprocess_cache_mousexeniumniche_svd/
+preprocess_cache_mousexeniumniche_pca/
+results_mousexeniumniche_svd/
+results_mousexeniumniche_pca/
+```
+
+PCA requires densifying the binned feature matrix and can require much more RAM than SVD. Use PCA only for datasets small enough to fit in memory.
 
 ## Local / Workstation
 
@@ -55,6 +105,18 @@ Or run the two steps separately:
 ```bash
 python preprocess.py --config configs/mousexeniumniche.json
 python run_bgm_gpu.py --config configs/mousexeniumniche.json
+```
+
+Overwrite existing preprocessing caches:
+
+```bash
+python preprocess.py --config configs/mousexeniumniche.json --force
+```
+
+or:
+
+```bash
+python run_sfumato.py --config configs/mousexeniumniche.json --force-preprocess
 ```
 
 ## Alvis / SLURM
@@ -79,14 +141,23 @@ sbatch/run_bgm_gpu.sbatch
 
 ## Outputs
 
-Preprocessing cache:
+For SVD:
 
 ```text
 preprocess_cache_mousexeniumniche_svd/
   mousexeniumniche_BIN40_F8_SVD10.npz
 ```
 
-BGM outputs are grouped by `K` and `COMP`:
+For PCA:
+
+```text
+preprocess_cache_mousexeniumniche_pca/
+  mousexeniumniche_BIN40_F8_PCA10.npz
+```
+
+BGM outputs are grouped by method, `K`, and `COMP`.
+
+SVD example:
 
 ```text
 results_mousexeniumniche_svd/
@@ -96,6 +167,23 @@ results_mousexeniumniche_svd/
       *_binlevel_FULL.csv
       hues_*.csv
       weights_*.txt
+      *_bgm_config.json
+      images/
+        *_oversampled_dendrogram_cut.png
+        *_final_dendrogram_colors.png
+```
+
+PCA example:
+
+```text
+results_mousexeniumniche_pca/
+  K15/
+    PCA10/
+      *_FULL.h5ad
+      *_binlevel_FULL.csv
+      hues_*.csv
+      weights_*.txt
+      *_bgm_config.json
       images/
         *_oversampled_dendrogram_cut.png
         *_final_dendrogram_colors.png
@@ -120,6 +208,23 @@ For one K only:
 ```bash
 python plot_embedding_umap.py --config configs/mousexeniumniche.json --k 30
 ```
+
+If both SVD and PCA are enabled in the config, UMAP plots are generated for both methods.
+
+Plot the first two embedding dimensions directly, without UMAP:
+
+```bash
+python plot_embedding_dims.py --config configs/mousexeniumniche.json
+```
+
+For one K only:
+
+```bash
+python plot_embedding_dims.py --config configs/mousexeniumniche.json --k 30
+```
+
+For PCA caches these are `PC1/PC2`.  
+For SVD caches these are `SVD1/SVD2`.
 
 Hue equalization figure from a `hues_*.csv` file:
 

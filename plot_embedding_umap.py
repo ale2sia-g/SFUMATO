@@ -2,7 +2,7 @@
 """Plot UMAP representations from preprocessing caches and BGM bin CSVs."""
 
 from __future__ import annotations
-
+import gc
 import argparse
 from pathlib import Path
 

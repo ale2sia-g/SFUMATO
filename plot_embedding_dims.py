@@ -169,6 +169,7 @@ def plot_for_k(
     )
 
     emb2d = X_norm[idx, :2]
+    dim3 = X_norm[idx, 2] if X_norm.shape[1] >= 3 else None
     pos_sub = pos[idx]
     ids_sub = good_bin_ids[idx]
     meta_sub = meta.iloc[idx].reset_index(drop=True) if meta is not None else None
@@ -176,6 +177,7 @@ def plot_for_k(
     prefix = method.upper()
     xlab = f"{prefix}1" if method == "svd" else "PC1"
     ylab = f"{prefix}2" if method == "svd" else "PC2"
+    zlab = f"{prefix}3" if method == "svd" else "PC3"
 
     out_dict = {
         "bin_id": ids_sub,
@@ -184,6 +186,8 @@ def plot_for_k(
         "x": pos_sub[:, 0],
         "y": pos_sub[:, 1],
     }
+    if dim3 is not None:
+        out_dict[zlab] = dim3
 
     out = pd.DataFrame(out_dict)
     if meta_sub is not None:
@@ -205,6 +209,18 @@ def plot_for_k(
         ylabel=ylab,
         point_size=point_size,
     )
+
+    if dim3 is not None:
+        save_scatter(
+            image_dir / f"{stem}_{prefix}1_{prefix}2_colored_by_{prefix}3.png",
+            emb2d,
+            values=dim3,
+            title=f"{stem}: {xlab}/{ylab} colored by {zlab}",
+            xlabel=xlab,
+            ylabel=ylab,
+            cmap="viridis",
+            point_size=point_size,
+        )
 
     save_scatter(
         image_dir / f"{stem}_{prefix}1_{prefix}2_spatial_x.png",

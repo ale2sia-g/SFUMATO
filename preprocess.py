@@ -4,12 +4,16 @@
 This script is dataset-agnostic. All run-specific values are read from a
 shared config file so the same config can be used by the CPU preprocessing
 job, the GPU BGM job, and local single-process runs.
+
+The preprocessing step runs points2regions once, then writes one cache per
+enabled dimensionality-reduction method: SVD, PCA, or both.
 """
 
 from __future__ import annotations
 
 import argparse
 import gc
+import json
 import os
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -51,16 +55,30 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_common_save_dict(
-    X_rare,
-    good_bin_ids,
-    pos,
-    back_map,
-    df_run,
-    good_bins,
+    X_rare: np.ndarray,
+    rare_group_names: np.ndarray,
+    rare_group_genes: dict,
+    rare_group_genes_present: dict,
+    genes_all: np.ndarray,
+    good_bin_ids: np.ndarray,
+    pos: np.ndarray,
+    back_map: np.ndarray,
+    df_run: pd.DataFrame,
+    good_bins: np.ndarray,
     cfg: PreprocessConfig,
 ) -> dict:
     return dict(
         X_rare=X_rare,
+        rare_group_names=np.asarray(rare_group_names, dtype=object),
+        rare_group_genes_json=np.array(
+            [json.dumps(rare_group_genes, sort_keys=True)],
+            dtype=object,
+        ),
+        rare_group_genes_present_json=np.array(
+            [json.dumps(rare_group_genes_present, sort_keys=True)],
+            dtype=object,
+        ),
+        genes_all=np.asarray(genes_all, dtype=object),
         good_bin_ids=good_bin_ids.astype(np.int32),
         pos=pos.astype(np.float32),
         back_map=back_map.astype(np.int32),
@@ -74,20 +92,24 @@ def build_common_save_dict(
     )
 
 
-def add_p2r_to_save_dict(save_dict: dict, p2r_outputs: dict) -> None:
-    for key, value in p2r_outputs.items():
-        save_dict[key] = value
+def add_p2r_to_save_dict(
+    save_dict: dict,
+    p2r_results: dict[int, tuple[np.ndarray, np.ndarray]],
+) -> None:
+    for k, (cluster_p2r_bins, p2r_color_bins) in p2r_results.items():
+        cluster_key, color_key = p2r_cache_keys(k)
+        save_dict[cluster_key] = cluster_p2r_bins
+        save_dict[color_key] = p2r_color_bins
 
 
-def run_p2r_clustering(res, good_bins, cfg: PreprocessConfig) -> dict:
-    p2r_outputs = {}
+def run_p2r_clustering(
+    X_p2r,
+    good_bins: np.ndarray,
+    k_list: list[int],
+) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    p2r_results: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 
-    if not cfg.save_p2r:
-        return p2r_outputs
-
-    X_p2r = res["X_all"]
-
-    for k in cfg.k_list:
+    for k in k_list:
         k_p2r = int(k)
         print(f"Running P2R clustering for K={k_p2r}...", flush=True)
 
@@ -123,62 +145,57 @@ def run_p2r_clustering(res, good_bins, cfg: PreprocessConfig) -> dict:
         for c, color in enumerate(p2r_color_list):
             p2r_color_bins[cluster_p2r_bins == c] = color
 
-        cluster_key, color_key = p2r_cache_keys(k_p2r)
-        p2r_outputs[cluster_key] = cluster_p2r_bins
-        p2r_outputs[color_key] = p2r_color_bins
-
+        p2r_results[k_p2r] = (cluster_p2r_bins, p2r_color_bins)
         print(f"  P2R clusters for K={k_p2r}: {n_p2r} unique", flush=True)
 
-        del km, Z_p2r, merged_p2r, cluster_p2r_bins, p2r_color_bins
-        del p2r_centers, p2r_color_list, km_labels
+        del km, Z_p2r, merged_p2r, km_labels
+        del p2r_centers, p2r_color_list
         gc.collect()
 
-    return p2r_outputs
+    return p2r_results
 
 
-def compute_embedding(X_all_sparse, cfg: PreprocessConfig, method: str):
+def compute_embedding(method: str, X_all_sparse, cfg: PreprocessConfig) -> np.ndarray:
     label = method_label(method)
+    print(f"{label} ({cfg.comp} components)...", flush=True)
 
     if method == "svd":
-        print(f"TruncatedSVD ({cfg.comp} components)...", flush=True)
         reducer = TruncatedSVD(n_components=cfg.comp, random_state=cfg.seed)
         X_norm = reducer.fit_transform(X_all_sparse).astype(np.float32)
+        explained = reducer.explained_variance_ratio_
     elif method == "pca":
-        print(f"PCA ({cfg.comp} components)...", flush=True)
-        print("  Densifying X_all for PCA. This can require a lot of RAM.", flush=True)
-        X_all_dense = to_dense_float32(X_all_sparse)
+        X_dense = to_dense_float32(X_all_sparse)
         reducer = PCA(n_components=cfg.comp, random_state=cfg.seed)
-        X_norm = reducer.fit_transform(X_all_dense).astype(np.float32)
-        del X_all_dense
+        X_norm = reducer.fit_transform(X_dense).astype(np.float32)
+        explained = reducer.explained_variance_ratio_
+        del X_dense
     else:
         raise ValueError(f"Unknown reduction method: {method}")
 
-    explained_variance_ratio = reducer.explained_variance_ratio_.astype(np.float32)
-
-    print(
-        f"  Explained variance: {explained_variance_ratio.round(3)}",
-        flush=True,
-    )
-    print(f"  Cumulative: {explained_variance_ratio.sum():.3f}", flush=True)
+    print(f"  Explained variance: {explained.round(3)}", flush=True)
+    print(f"  Cumulative: {explained.sum():.3f}", flush=True)
 
     del reducer
     gc.collect()
-
-    return X_norm, label, explained_variance_ratio
+    return X_norm
 
 
 def save_cache_for_method(
     method: str,
-    X_all_sparse,
+    X_norm: np.ndarray,
     common_save_dict: dict,
-    p2r_outputs: dict,
+    p2r_results: dict[int, tuple[np.ndarray, np.ndarray]],
     cfg: PreprocessConfig,
     config: dict,
-    rare_gene_list,
-    df_run,
+    rare_gene_groups: dict[str, list[str]],
+    rare_group_names: np.ndarray,
+    rare_group_genes_present: dict,
+    n_transcripts: int,
     n_genes: int,
+    n_good_bins: int,
     force: bool,
 ) -> None:
+    use_svd = method_uses_svd(method)
     cache_dir = method_cache_dir(cfg.cache_dir, method)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -187,7 +204,7 @@ def save_cache_for_method(
         cfg.bin_width,
         cfg.factor,
         cfg.comp,
-        method_uses_svd(method),
+        use_svd,
     )
     cache_file = cache_dir / f"{stem}.npz"
 
@@ -195,19 +212,11 @@ def save_cache_for_method(
         print(f"{cache_file} exists, skipping. Use --force to overwrite.", flush=True)
         return
 
-    X_norm, label, explained_variance_ratio = compute_embedding(
-        X_all_sparse,
-        cfg,
-        method,
-    )
-
     save_dict = dict(common_save_dict)
-    add_p2r_to_save_dict(save_dict, p2r_outputs)
     save_dict["X_norm"] = X_norm
-    save_dict["reduction_method"] = np.array([label])
-    save_dict["explained_variance_ratio"] = explained_variance_ratio
+    add_p2r_to_save_dict(save_dict, p2r_results)
 
-    print(f"Saving cache to {cache_file}...", flush=True)
+    print(f"Saving {method_label(method)} cache to {cache_file}...", flush=True)
     np.savez_compressed(cache_file, **save_dict)
 
     save_json(
@@ -222,16 +231,14 @@ def save_cache_for_method(
                 "num_id": cfg.num_id_col,
             },
             "preprocess": config.get("preprocess", {}),
+            "reduction_method": method,
             "cache_file": str(cache_file),
-            "reduction_method": label,
-            "use_svd": method == "svd",
-            "use_pca": method == "pca",
-            "comp": cfg.comp,
-            "rare_gene_list_used": rare_gene_list,
-            "n_transcripts": int(len(df_run)),
+            "rare_gene_groups_used": rare_gene_groups,
+            "rare_group_names": [str(x) for x in rare_group_names],
+            "rare_group_genes_present": rare_group_genes_present,
+            "n_transcripts": int(n_transcripts),
             "n_genes": int(n_genes),
-            "n_good_bins": int(len(common_save_dict["good_bin_ids"])),
-            "explained_variance_cumulative": float(explained_variance_ratio.sum()),
+            "n_good_bins": int(n_good_bins),
         },
     )
 
@@ -243,7 +250,7 @@ def save_cache_for_method(
         flush=True,
     )
 
-    del X_norm, save_dict, explained_variance_ratio
+    del save_dict
     gc.collect()
 
 
@@ -253,16 +260,19 @@ def run_preprocess(config: dict, force: bool = False) -> None:
     cfg = PreprocessConfig.from_dict(config)
     methods = reduction_methods_from_config(cfg)
 
-    print(f"Selected dimensionality reductions: {methods}", flush=True)
-
     print(f"Reading input CSV: {cfg.input_csv}", flush=True)
     df_raw = pd.read_csv(cfg.input_csv)
     df = validate_and_standardize_dataframe(df_raw, cfg)
     gene_positions = df[["x", "y"]].to_numpy()
-    rare_gene_list = resolve_rare_genes(df, cfg.rare_genes)
+    rare_gene_groups = resolve_rare_genes(df, cfg.rare_genes)
 
     print(f"There are {df.target_name.nunique()} gene types", flush=True)
-    print(f"Rare genes used by points2regions: {rare_gene_list}", flush=True)
+    print(f"Rare gene groups used by points2regions: {rare_gene_groups}", flush=True)
+    print(
+        "Enabled dimensionality reductions: "
+        + ", ".join(method_label(method) for method in methods),
+        flush=True,
+    )
     print("Running soa_points2regions_withsplit once for this run...", flush=True)
 
     res = points2regions_withsplit(
@@ -270,7 +280,7 @@ def run_preprocess(config: dict, force: bool = False) -> None:
         labels=df["target_name"].to_numpy(),
         bin_width=cfg.bin_width,
         smooth=cfg.factor,
-        rare_genes=rare_gene_list,
+        rare_genes=rare_gene_groups,
         min_genes_per_bin=cfg.min_genes_per_bin,
         alpha=cfg.alpha,
     )
@@ -285,18 +295,39 @@ def run_preprocess(config: dict, force: bool = False) -> None:
     X_all_sparse = res["X_all"][good_bins].astype(np.float32)
     X_rare = to_dense_float32(res["X_rare"][good_bins])
 
+    rare_group_names = np.asarray(
+        res.get("rare_group_names", np.array([], dtype=object)),
+        dtype=object,
+    )
+    rare_group_genes = res.get("rare_group_genes", {})
+    rare_group_genes_present = res.get("rare_group_genes_present", {})
+    genes_all = np.asarray(res.get("genes_all", np.array([], dtype=object)), dtype=object)
+
     print(f"  Good bins: {good_bins.sum():,} / {len(good_bins):,}", flush=True)
     print(
         f"  X_all sparse: {X_all_sparse.shape}, nnz={X_all_sparse.nnz:,}",
         flush=True,
     )
     print(f"  X_rare: {X_rare.shape}, {X_rare.nbytes / 1e6:.1f} MB", flush=True)
+    print(f"  Rare groups present: {list(rare_group_names)}", flush=True)
 
     df_run = df.copy()
     df_run["bin_id"] = back_map
 
+    p2r_results: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    if cfg.save_p2r:
+        p2r_results = run_p2r_clustering(
+            res["X_all"],
+            good_bins,
+            cfg.k_list,
+        )
+
     common_save_dict = build_common_save_dict(
         X_rare=X_rare,
+        rare_group_names=rare_group_names,
+        rare_group_genes=rare_group_genes,
+        rare_group_genes_present=rare_group_genes_present,
+        genes_all=genes_all,
         good_bin_ids=good_bin_ids,
         pos=pos,
         back_map=back_map,
@@ -305,23 +336,27 @@ def run_preprocess(config: dict, force: bool = False) -> None:
         cfg=cfg,
     )
 
-    p2r_outputs = run_p2r_clustering(res, good_bins, cfg)
-
     for method in methods:
+        X_norm = compute_embedding(method, X_all_sparse, cfg)
         save_cache_for_method(
             method=method,
-            X_all_sparse=X_all_sparse,
+            X_norm=X_norm,
             common_save_dict=common_save_dict,
-            p2r_outputs=p2r_outputs,
+            p2r_results=p2r_results,
             cfg=cfg,
             config=config,
-            rare_gene_list=rare_gene_list,
-            df_run=df_run,
+            rare_gene_groups=rare_gene_groups,
+            rare_group_names=rare_group_names,
+            rare_group_genes_present=rare_group_genes_present,
+            n_transcripts=len(df_run),
             n_genes=df_run["target_name"].nunique(),
+            n_good_bins=len(good_bin_ids),
             force=force,
         )
+        del X_norm
+        gc.collect()
 
-    del res, X_all_sparse, X_rare, common_save_dict, p2r_outputs
+    del res, X_all_sparse, X_rare, common_save_dict, p2r_results
     del df_run, df_raw, df
     gc.collect()
 

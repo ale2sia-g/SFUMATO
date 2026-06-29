@@ -100,25 +100,61 @@ def validate_and_standardize_dataframe(df: pd.DataFrame, cfg: PreprocessConfig) 
     return out
 
 
-def resolve_rare_genes(df: pd.DataFrame, rare_genes: Any | None) -> list[str]:
-    # TODO: replace flat rare-gene handling with marker-group dictionaries.
-    if isinstance(rare_genes, dict) and rare_genes:
-        flattened: list[str] = []
-        for value in rare_genes.values():
-            if isinstance(value, str):
-                flattened.append(value)
+def resolve_rare_genes(df: pd.DataFrame, rare_genes: Any | None) -> dict[str, list[str]]:
+    """
+    Normalize rare marker configuration.
+
+    Accepted config values
+    ----------------------
+    null / None / {}:
+        No rare marker groups. Returns {}.
+
+    dict:
+        {
+            "group_A": ["gene1"],
+            "group_B": ["gene2", "gene3"]
+        }
+
+    list/tuple/set:
+        Backward-compatible convenience. Converted to:
+        {
+            "rare": [...]
+        }
+
+    No automatic fallback gene is selected. This keeps runs without rare genes
+    identical to ordinary SFUMATO runs.
+    """
+    if rare_genes is None:
+        return {}
+
+    if isinstance(rare_genes, dict):
+        out: dict[str, list[str]] = {}
+        for group_name, genes in rare_genes.items():
+            group_name = str(group_name)
+
+            if genes is None:
+                gene_list: list[str] = []
+            elif isinstance(genes, str):
+                gene_list = [genes]
             else:
-                flattened.extend([str(v) for v in value])
-        if flattened:
-            return sorted(set(flattened))
+                gene_list = [str(g) for g in genes]
 
-    if isinstance(rare_genes, (list, tuple, set)) and rare_genes:
-        return sorted(set(str(g) for g in rare_genes))
+            gene_list = sorted(set(gene_list))
+            if gene_list:
+                out[group_name] = gene_list
 
-    counts = df[STANDARD_GENE].value_counts()
-    if counts.empty:
-        raise ValueError("Cannot infer rare gene from an empty gene column.")
-    return [str(counts.idxmin())]
+        return out
+
+    if isinstance(rare_genes, (list, tuple, set)):
+        gene_list = sorted(set(str(g) for g in rare_genes))
+        if not gene_list:
+            return {}
+        return {"rare": gene_list}
+
+    raise TypeError(
+        "preprocess.rare_genes must be null, a dictionary of marker groups, "
+        "or a list of genes."
+    )
 
 
 def to_dense_float32(X: Any) -> np.ndarray:

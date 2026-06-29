@@ -24,17 +24,21 @@ from utils_bgm import (
     cache_file_for,
     centroids_to_hsv_rgb,
     color_mix_top2_log,
+    combined_merge_distance,
     csv_to_h5ad,
     get_p2r_from_cache,
+    has_rare_groups,
     image_dir_for,
+    load_json_cache_field,
+    load_rare_group_names,
     merge_centroids_by_groups,
     merge_probabilities_from_labels,
-    normalize_condensed,
     plot_final_dendrogram_with_colors,
     plot_oversampled_dendrogram,
+    plot_rare_group_heatmaps,
+    rare_group_soft_means,
     result_dir_for,
     rgb01_to_hex,
-    safe_cosine_pdist,
     save_json,
     soft_cluster_centroids,
     top2_from_proba,
@@ -56,11 +60,21 @@ def load_cache_for_method(cfg: BGMConfig, method: str):
     print(f"Loading {method.upper()} cache from {cache_file}...", flush=True)
     data = np.load(cache_file, allow_pickle=True)
 
+    rare_group_names = load_rare_group_names(data)
+    rare_group_genes = load_json_cache_field(data, "rare_group_genes_json")
+    rare_group_genes_present = load_json_cache_field(
+        data,
+        "rare_group_genes_present_json",
+    )
+
     payload = {
         "cache_file": cache_file,
         "data": data,
         "X_norm": data["X_norm"],
         "X_rare": data["X_rare"],
+        "rare_group_names": rare_group_names,
+        "rare_group_genes": rare_group_genes,
+        "rare_group_genes_present": rare_group_genes_present,
         "good_bin_ids": data["good_bin_ids"],
         "pos": data["pos"],
         "back_map": data["back_map"],
@@ -72,8 +86,46 @@ def load_cache_for_method(cfg: BGMConfig, method: str):
 
     print(f"  X_norm: {payload['X_norm'].shape}", flush=True)
     print(f"  X_rare: {payload['X_rare'].shape}", flush=True)
+    print(f"  Rare groups: {list(rare_group_names)}", flush=True)
 
     return payload
+
+
+def save_merge_distances(
+    outdir,
+    stem: str,
+    d_comb: np.ndarray,
+    d_all: np.ndarray,
+    d_rare: np.ndarray | None,
+) -> None:
+    """
+    Save condensed pairwise merge distances between oversampled BGM components.
+
+    For K_bgm components, each row is one pair of oversampled components.
+    """
+    n_pairs = len(d_all)
+    if n_pairs == 0:
+        return
+
+    n_components = int((1 + np.sqrt(1 + 8 * n_pairs)) / 2)
+    rows = []
+    idx = 0
+    for i in range(n_components - 1):
+        for j in range(i + 1, n_components):
+            rows.append(
+                {
+                    "component_i": i,
+                    "component_j": j,
+                    "d_all": float(d_all[idx]),
+                    "d_rare": float(d_rare[idx]) if d_rare is not None else np.nan,
+                    "d_comb": float(d_comb[idx]),
+                }
+            )
+            idx += 1
+
+    path = outdir / f"{stem}_oversampled_merge_distances.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    print(f"  Saved {path}", flush=True)
 
 
 def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
@@ -83,6 +135,9 @@ def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
     data = payload["data"]
     X_norm = payload["X_norm"]
     X_rare = payload["X_rare"]
+    rare_group_names = payload["rare_group_names"]
+    rare_group_genes = payload["rare_group_genes"]
+    rare_group_genes_present = payload["rare_group_genes_present"]
     good_bin_ids = payload["good_bin_ids"]
     pos = payload["pos"]
     back_map = payload["back_map"]
@@ -90,6 +145,8 @@ def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
     gene_y = payload["gene_y"]
     gene_name = payload["gene_name"]
     gene_bin_id = payload["gene_bin_id"]
+
+    has_rare = has_rare_groups(X_rare, rare_group_names)
 
     df_run = pd.DataFrame(
         {
@@ -117,6 +174,8 @@ def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
         print(f"\n{'=' * 60}", flush=True)
         print(f"Reduction method={method.upper()}", flush=True)
         print(f"K={k}, K_bgm={k_bgm}, oversample={oversample}", flush=True)
+        print(f"beta_rare={cfg.beta_rare}", flush=True)
+        print(f"Rare groups available={has_rare}", flush=True)
         print(f"Output directory: {outdir}", flush=True)
 
         has_p2r = cfg.save_p2r
@@ -143,22 +202,44 @@ def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
         proba = bgm.predict_proba(X_norm)
 
         centroids_soft, masses = soft_cluster_centroids(X_norm, proba)
-        centroids_rare_soft, _ = soft_cluster_centroids(X_rare, proba)
         centroids_for_merge = centroids_soft
-        centroids_rare_for_merge = centroids_rare_soft
+
+        if has_rare:
+            centroids_rare_soft, _ = soft_cluster_centroids(X_rare, proba)
+            centroids_rare_for_merge = centroids_rare_soft
+        else:
+            centroids_rare_soft = None
+            centroids_rare_for_merge = None
+
         print("  Using soft centroids", flush=True)
 
         Z_link = None
+        d_all = None
+        d_rare = None
+        d_comb = None
+
         if oversample:
             print(f"Merging {proba.shape[1]} -> {k} clusters...", flush=True)
 
-            d_all = normalize_condensed(safe_cosine_pdist(centroids_for_merge))
+            d_comb, d_all, d_rare = combined_merge_distance(
+                centroids_all=centroids_for_merge,
+                centroids_rare=centroids_rare_for_merge,
+                beta_rare=cfg.beta_rare,
+            )
 
-            # TODO: complete rare-gene distance contribution before enabling this.
-            # d_rare = normalize_condensed(safe_cosine_pdist(centroids_rare_for_merge))
-            # d_comb = d_all + cfg.beta_rare * d_rare
+            if d_rare is None:
+                print("  Rare groups not used in merge distance.", flush=True)
+            else:
+                print("  Rare groups used in merge distance.", flush=True)
 
-            d_comb = d_all
+            save_merge_distances(
+                outdir=outdir,
+                stem=stem,
+                d_comb=d_comb,
+                d_all=d_all,
+                d_rare=d_rare,
+            )
+
             Z_link = linkage(d_comb, method=cfg.merge_method)
 
             plot_oversampled_dendrogram(
@@ -170,10 +251,32 @@ def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
 
             merge_labels = fcluster(Z_link, t=k, criterion="maxclust")
             proba, groups = merge_probabilities_from_labels(proba, merge_labels)
+
             centroids_for_merge, masses = merge_centroids_by_groups(
-                centroids_for_merge, masses, groups
+                centroids_for_merge,
+                masses,
+                groups,
             )
+
+            if centroids_rare_for_merge is not None:
+                centroids_rare_for_merge, _ = merge_centroids_by_groups(
+                    centroids_rare_for_merge,
+                    np.ones(centroids_rare_for_merge.shape[0], dtype=float),
+                    groups,
+                )
+
             print(f"  Final clusters: {proba.shape[1]}", flush=True)
+
+        rare_scores = rare_group_soft_means(
+            X_rare=X_rare,
+            proba=proba,
+            rare_group_names=rare_group_names,
+        )
+        plot_rare_group_heatmaps(
+            rare_scores=rare_scores,
+            outdir=image_dir,
+            stem=stem,
+        )
 
         print("PCA on final cluster centroids for colors...", flush=True)
         pca_color = PCA(n_components=3, random_state=cfg.seed)
@@ -287,7 +390,13 @@ def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
         with weights_file.open("w", encoding="utf-8") as f:
             f.write(f"Reduction method={method.upper()}\n")
             f.write(f"K={k}, K_bgm={k_bgm}\n")
-            f.write("BGM weights:\n")
+            f.write(f"beta_rare={cfg.beta_rare}\n")
+            f.write(f"rare_groups_available={has_rare}\n")
+            f.write(f"rare_groups_used_in_merge={d_rare is not None}\n")
+            f.write(f"rare_group_names={list(rare_group_names)}\n")
+            f.write(f"rare_group_genes={rare_group_genes}\n")
+            f.write(f"rare_group_genes_present={rare_group_genes_present}\n")
+            f.write("\nBGM weights:\n")
             for i, weight in enumerate(bgm.weights_):
                 f.write(f"Component {i}: {weight}\n")
             f.write("\nCluster masses:\n")
@@ -309,7 +418,8 @@ def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
             transcript_proba_rows = bin_id_to_row[transcript_bin_ids]
 
             proba_transcripts = np.zeros(
-                (len(df_run), n_clusters_final), dtype=np.float32
+                (len(df_run), n_clusters_final),
+                dtype=np.float32,
             )
             valid_mask = transcript_proba_rows >= 0
             proba_transcripts[valid_mask] = proba[
@@ -352,21 +462,40 @@ def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
                 "bgm": config.get("bgm", {}),
                 "preprocess": config.get("preprocess", {}),
                 "save_transcript_proba": cfg.save_transcript_proba,
+                "beta_rare": cfg.beta_rare,
+                "rare_groups_available": has_rare,
+                "rare_groups_used_in_merge": d_rare is not None,
+                "rare_group_names": [str(x) for x in rare_group_names],
+                "rare_group_genes": rare_group_genes,
+                "rare_group_genes_present": rare_group_genes_present,
             },
         )
 
-        del bgm, proba, centroids_soft, centroids_rare_soft
-        del centroids_for_merge, centroids_rare_for_merge, masses
+        del bgm, proba, centroids_soft
+        del centroids_for_merge, masses
         del pca_color, X_pca_color, means_3d
         del cluster, second_cluster, p1, p2, rgb, hue, h_shifted, h_new
         del centroid_colors, df_bins, df_mappedback, df_colors, adata_output
+        del rare_scores
+        if centroids_rare_soft is not None:
+            del centroids_rare_soft
+        if centroids_rare_for_merge is not None:
+            del centroids_rare_for_merge
         if Z_link is not None:
             del Z_link
+        if d_all is not None:
+            del d_all
+        if d_rare is not None:
+            del d_rare
+        if d_comb is not None:
+            del d_comb
         gc.collect()
         print(f"  Done {method.upper()} K={k}", flush=True)
 
     data.close()
-    del data, X_norm, X_rare, good_bin_ids, pos, back_map
+    del data, X_norm, X_rare, rare_group_names
+    del rare_group_genes, rare_group_genes_present
+    del good_bin_ids, pos, back_map
     del gene_x, gene_y, gene_name, gene_bin_id, df_run
     gc.collect()
 

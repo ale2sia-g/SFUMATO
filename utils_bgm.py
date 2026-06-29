@@ -247,7 +247,9 @@ def color_mix_top2_log(
 
 
 def soft_cluster_centroids(
-    X: np.ndarray, proba: np.ndarray, eps: float = 1e-12
+    X: np.ndarray,
+    proba: np.ndarray,
+    eps: float = 1e-12,
 ) -> tuple[np.ndarray, np.ndarray]:
     masses = proba.sum(axis=0) + eps
     centroids = (proba.T @ X) / masses[:, None]
@@ -267,6 +269,195 @@ def safe_cosine_pdist(X: np.ndarray, eps: float = 1e-10) -> np.ndarray:
     return pdist(X_normed, metric="euclidean")
 
 
+def has_rare_groups(X_rare: np.ndarray, rare_group_names: np.ndarray | None = None) -> bool:
+    if X_rare is None:
+        return False
+    if X_rare.ndim != 2:
+        return False
+    if X_rare.shape[1] == 0:
+        return False
+    if rare_group_names is not None and len(rare_group_names) == 0:
+        return False
+    return True
+
+
+def rare_group_distance_max(
+    rare_centroids: np.ndarray,
+) -> np.ndarray | None:
+    """
+    Compute one condensed distance vector from rare-group centroids.
+
+    rare_centroids has shape:
+        n_clusters x n_rare_groups
+
+    For each rare group, distances are computed between cluster-level
+    soft means using euclidean distance on that single rare-group score.
+
+    The final rare distance is the elementwise maximum across rare groups.
+    This preserves a strong difference in any marker group instead of diluting
+    it by averaging across unrelated groups.
+    """
+    rare_centroids = np.asarray(rare_centroids, dtype=float)
+
+    if rare_centroids.ndim != 2 or rare_centroids.shape[1] == 0:
+        return None
+
+    distances = []
+    for group_idx in range(rare_centroids.shape[1]):
+        values = rare_centroids[:, group_idx : group_idx + 1]
+        distances.append(normalize_condensed(pdist(values, metric="euclidean")))
+
+    if not distances:
+        return None
+
+    return np.maximum.reduce(distances)
+
+
+def combined_merge_distance(
+    centroids_all: np.ndarray,
+    centroids_rare: np.ndarray | None,
+    beta_rare: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """
+    Build the distance used for hierarchical merging.
+
+    d_all is always computed from the embedding centroids.
+
+    If beta_rare > 0 and rare-group centroids are available, d_rare is computed
+    as the maximum rare-group distance across marker groups, then added to d_all.
+
+    If rare groups are absent, this function returns the original d_all path.
+    """
+    d_all = normalize_condensed(safe_cosine_pdist(centroids_all))
+
+    if beta_rare <= 0 or centroids_rare is None:
+        return d_all, d_all, None
+
+    d_rare = rare_group_distance_max(centroids_rare)
+    if d_rare is None:
+        return d_all, d_all, None
+
+    d_comb = d_all + beta_rare * d_rare
+    return d_comb, d_all, d_rare
+
+
+def rare_group_soft_means(
+    X_rare: np.ndarray,
+    proba: np.ndarray,
+    rare_group_names: np.ndarray,
+) -> pd.DataFrame | None:
+    """
+    Return soft mean rare-group scores per final cluster.
+
+    Output dataframe:
+        rows    = rare groups
+        columns = cluster ids
+    """
+    if not has_rare_groups(X_rare, rare_group_names):
+        return None
+
+    rare_centroids, _ = soft_cluster_centroids(X_rare, proba)
+    cluster_labels = [f"C{i}" for i in range(rare_centroids.shape[0])]
+    group_labels = [str(x) for x in rare_group_names]
+
+    return pd.DataFrame(
+        rare_centroids.T,
+        index=group_labels,
+        columns=cluster_labels,
+    )
+
+
+def row_zscore(df: pd.DataFrame, eps: float = 1e-8) -> pd.DataFrame:
+    values = df.to_numpy(dtype=float)
+    mean = values.mean(axis=1, keepdims=True)
+    std = values.std(axis=1, keepdims=True)
+    z = (values - mean) / (std + eps)
+    return pd.DataFrame(z, index=df.index, columns=df.columns)
+
+
+def plot_rare_group_heatmaps(
+    rare_scores: pd.DataFrame | None,
+    outdir: Path,
+    stem: str,
+) -> None:
+    """
+    Save rare-group soft-mean CSVs and heatmaps.
+
+    The raw heatmap shows absolute soft mean marker-group scores.
+    The z-scored heatmap shows which clusters are relatively enriched for each
+    rare group.
+    """
+    if rare_scores is None or rare_scores.empty:
+        return
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    raw_csv = outdir / f"{stem}_rare_group_soft_means.csv"
+    z_csv = outdir / f"{stem}_rare_group_soft_means_row_zscore.csv"
+    raw_png = outdir / f"{stem}_rare_group_soft_means_heatmap.png"
+    z_png = outdir / f"{stem}_rare_group_soft_means_row_zscore_heatmap.png"
+
+    rare_scores.to_csv(raw_csv)
+    rare_scores_z = row_zscore(rare_scores)
+    rare_scores_z.to_csv(z_csv)
+
+    col_cluster = rare_scores.shape[1] > 1
+    row_cluster = rare_scores.shape[0] > 1
+
+    sns.set_theme(style="white", font_scale=0.8)
+
+    g = sns.clustermap(
+        rare_scores,
+        cmap="mako",
+        row_cluster=row_cluster,
+        col_cluster=col_cluster,
+        linewidths=0.2,
+        figsize=(max(6, rare_scores.shape[1] * 0.45), max(4, rare_scores.shape[0] * 0.35)),
+        cbar_kws={"label": "soft mean score"},
+    )
+    g.fig.suptitle("Rare marker-group soft means", y=1.02)
+    g.savefig(raw_png, dpi=220, bbox_inches="tight")
+    plt.close(g.fig)
+
+    g = sns.clustermap(
+        rare_scores_z,
+        cmap="vlag",
+        center=0,
+        row_cluster=row_cluster,
+        col_cluster=col_cluster,
+        linewidths=0.2,
+        figsize=(max(6, rare_scores.shape[1] * 0.45), max(4, rare_scores.shape[0] * 0.35)),
+        cbar_kws={"label": "row z-score"},
+    )
+    g.fig.suptitle("Rare marker-group relative enrichment", y=1.02)
+    g.savefig(z_png, dpi=220, bbox_inches="tight")
+    plt.close(g.fig)
+
+
+def load_rare_group_names(data: Any) -> np.ndarray:
+    if "rare_group_names" not in data:
+        return np.array([], dtype=object)
+    return np.asarray(data["rare_group_names"], dtype=object)
+
+
+def load_json_cache_field(data: Any, key: str) -> dict:
+    if key not in data:
+        return {}
+    value = data[key]
+    if len(value) == 0:
+        return {}
+    item = value[0]
+    if isinstance(item, bytes):
+        item = item.decode("utf-8")
+    return json.loads(str(item))
+
+
 def top2_from_proba(P: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     cluster = P.argmax(axis=1)
     p1 = P.max(axis=1)
@@ -279,7 +470,8 @@ def top2_from_proba(P: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, 
 
 
 def merge_probabilities_from_labels(
-    proba: np.ndarray, merge_labels: np.ndarray
+    proba: np.ndarray,
+    merge_labels: np.ndarray,
 ) -> tuple[np.ndarray, list[np.ndarray]]:
     merge_labels = np.asarray(merge_labels)
     uniq = np.unique(merge_labels)

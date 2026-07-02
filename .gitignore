@@ -10,3 +10,6 @@ preprocess_xenium_data/
 *.sif
 *.csv
 *.zip
+
+convert_*.py 
+extract_*.py

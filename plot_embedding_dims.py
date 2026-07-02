@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot the first two embedding dimensions from preprocessing caches and BGM bin CSVs."""
+"""Plot the first SVD embedding dimensions from preprocessing cache and BGM bin CSVs."""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ import pandas as pd
 
 from utils_bgm import (
     BGMConfig,
-    bgm_methods_from_config,
     bgm_stem_for,
     cache_file_for,
     image_dir_for,
@@ -37,6 +36,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-points", type=int, default=None)
     parser.add_argument("--point-size", type=float, default=None)
     return parser.parse_args()
+
+
+def shared_k_bgm(cfg: BGMConfig) -> int:
+    return int(np.ceil(cfg.bgm_oversample * max(int(k) for k in cfg.k_list)))
 
 
 def read_bin_metadata(bin_csv: Path | None) -> pd.DataFrame | None:
@@ -73,9 +76,9 @@ def choose_indices(
 
     if meta is not None and "cluster" in meta.columns:
         idx_parts = []
-        per_cluster_min = 500
         cluster_values = meta["cluster"].to_numpy()
-        clusters = pd.unique(meta["cluster"])
+        clusters = pd.unique(meta["cluster"].dropna())
+        per_cluster_min = 500
         base = max(per_cluster_min, max_points // max(len(clusters), 1))
 
         for cluster in clusters:
@@ -85,15 +88,18 @@ def choose_indices(
             keep = min(len(idx_c), base)
             idx_parts.append(rng.choice(idx_c, size=keep, replace=False))
 
-        idx = np.unique(np.concatenate(idx_parts))
-        if len(idx) > max_points:
-            idx = rng.choice(idx, size=max_points, replace=False)
-        elif len(idx) < max_points:
-            remaining = np.setdiff1d(np.arange(n), idx, assume_unique=False)
-            add_n = min(len(remaining), max_points - len(idx))
-            if add_n > 0:
-                idx = np.concatenate([idx, rng.choice(remaining, size=add_n, replace=False)])
-        return np.sort(idx)
+        if idx_parts:
+            idx = np.unique(np.concatenate(idx_parts))
+            if len(idx) > max_points:
+                idx = rng.choice(idx, size=max_points, replace=False)
+            elif len(idx) < max_points:
+                remaining = np.setdiff1d(np.arange(n), idx, assume_unique=False)
+                add_n = min(len(remaining), max_points - len(idx))
+                if add_n > 0:
+                    idx = np.concatenate(
+                        [idx, rng.choice(remaining, size=add_n, replace=False)]
+                    )
+            return np.sort(idx)
 
     return np.sort(rng.choice(n, size=max_points, replace=False))
 
@@ -104,15 +110,21 @@ def save_scatter(
     colors: np.ndarray | None = None,
     values: np.ndarray | None = None,
     title: str = "",
-    xlabel: str = "Dim1",
-    ylabel: str = "Dim2",
+    xlabel: str = "SVD1",
+    ylabel: str = "SVD2",
     cmap: str = "viridis",
     point_size: float = 0.35,
 ) -> None:
     fig, ax = plt.subplots(figsize=(8, 7), dpi=220)
+
     if colors is not None:
         ax.scatter(
-            emb2d[:, 0], emb2d[:, 1], c=colors, s=point_size, linewidths=0, alpha=0.85
+            emb2d[:, 0],
+            emb2d[:, 1],
+            c=colors,
+            s=point_size,
+            linewidths=0,
+            alpha=0.85,
         )
     elif values is not None:
         sc = ax.scatter(
@@ -141,8 +153,8 @@ def save_scatter(
 
 def plot_for_k(
     cfg: BGMConfig,
-    method: str,
     k: int,
+    k_bgm: int,
     X_norm: np.ndarray,
     good_bin_ids: np.ndarray,
     pos: np.ndarray,
@@ -151,20 +163,22 @@ def plot_for_k(
     if X_norm.shape[1] < 2:
         raise ValueError(f"X_norm has only {X_norm.shape[1]} dimensions; need at least 2.")
 
-    outdir = result_dir_for(cfg, k, method)
-    image_dir = image_dir_for(cfg, k, method)
+    outdir = result_dir_for(cfg, k)
+    image_dir = image_dir_for(cfg, k)
     image_dir.mkdir(parents=True, exist_ok=True)
 
-    stem = bgm_stem_for(cfg, k, method)
+    stem = bgm_stem_for(cfg, k, k_bgm)
     bin_csv = outdir / f"{stem}_binlevel_FULL.csv"
+
     meta = read_bin_metadata(bin_csv)
     if meta is not None:
         meta = meta.set_index("bin_id").reindex(good_bin_ids).reset_index()
 
     max_points = int(settings.get("max_points", 200000))
     idx = choose_indices(X_norm.shape[0], max_points, cfg.seed, meta)
+
     print(
-        f"{method.upper()} K={k}: using {len(idx):,} / {X_norm.shape[0]:,} bins for Dim1/Dim2 plot",
+        f"K={k}: using {len(idx):,} / {X_norm.shape[0]:,} bins for SVD1/SVD2 plot",
         flush=True,
     )
 
@@ -174,20 +188,15 @@ def plot_for_k(
     ids_sub = good_bin_ids[idx]
     meta_sub = meta.iloc[idx].reset_index(drop=True) if meta is not None else None
 
-    prefix = method.upper()
-    xlab = f"{prefix}1" if method == "svd" else "PC1"
-    ylab = f"{prefix}2" if method == "svd" else "PC2"
-    zlab = f"{prefix}3" if method == "svd" else "PC3"
-
     out_dict = {
         "bin_id": ids_sub,
-        xlab: emb2d[:, 0],
-        ylab: emb2d[:, 1],
+        "SVD1": emb2d[:, 0],
+        "SVD2": emb2d[:, 1],
         "x": pos_sub[:, 0],
         "y": pos_sub[:, 1],
     }
     if dim3 is not None:
-        out_dict[zlab] = dim3
+        out_dict["SVD3"] = dim3
 
     out = pd.DataFrame(out_dict)
     if meta_sub is not None:
@@ -195,51 +204,51 @@ def plot_for_k(
             if col not in out.columns:
                 out[col] = meta_sub[col].to_numpy()
 
-    csv_out = outdir / f"{stem}_{prefix}1_{prefix}2_sampled_bins.csv"
+    csv_out = outdir / f"{stem}_SVD1_SVD2_sampled_bins.csv"
     out.to_csv(csv_out, index=False)
     print(f"Saved: {csv_out}", flush=True)
 
     point_size = float(settings.get("point_size", 0.35))
 
     save_scatter(
-        image_dir / f"{stem}_{prefix}1_{prefix}2_plain.png",
+        image_dir / f"{stem}_SVD1_SVD2_plain.png",
         emb2d,
-        title=f"{stem}: {xlab}/{ylab}",
-        xlabel=xlab,
-        ylabel=ylab,
+        title=f"{stem}: SVD1/SVD2",
+        xlabel="SVD1",
+        ylabel="SVD2",
         point_size=point_size,
     )
 
     if dim3 is not None:
         save_scatter(
-            image_dir / f"{stem}_{prefix}1_{prefix}2_colored_by_{prefix}3.png",
+            image_dir / f"{stem}_SVD1_SVD2_colored_by_SVD3.png",
             emb2d,
             values=dim3,
-            title=f"{stem}: {xlab}/{ylab} colored by {zlab}",
-            xlabel=xlab,
-            ylabel=ylab,
+            title=f"{stem}: SVD1/SVD2 colored by SVD3",
+            xlabel="SVD1",
+            ylabel="SVD2",
             cmap="viridis",
             point_size=point_size,
         )
 
     save_scatter(
-        image_dir / f"{stem}_{prefix}1_{prefix}2_spatial_x.png",
+        image_dir / f"{stem}_SVD1_SVD2_spatial_x.png",
         emb2d,
         values=pos_sub[:, 0],
-        title=f"{stem}: {xlab}/{ylab} colored by spatial x",
-        xlabel=xlab,
-        ylabel=ylab,
+        title=f"{stem}: SVD1/SVD2 colored by spatial x",
+        xlabel="SVD1",
+        ylabel="SVD2",
         cmap="viridis",
         point_size=point_size,
     )
 
     save_scatter(
-        image_dir / f"{stem}_{prefix}1_{prefix}2_spatial_y.png",
+        image_dir / f"{stem}_SVD1_SVD2_spatial_y.png",
         emb2d,
         values=pos_sub[:, 1],
-        title=f"{stem}: {xlab}/{ylab} colored by spatial y",
-        xlabel=xlab,
-        ylabel=ylab,
+        title=f"{stem}: SVD1/SVD2 colored by spatial y",
+        xlabel="SVD1",
+        ylabel="SVD2",
         cmap="viridis",
         point_size=point_size,
     )
@@ -253,74 +262,50 @@ def plot_for_k(
             if col in meta_sub.columns:
                 colors = meta_sub[col].fillna("#aaaaaa").astype(str).to_numpy()
                 save_scatter(
-                    image_dir / f"{stem}_{prefix}1_{prefix}2_{suffix}.png",
+                    image_dir / f"{stem}_SVD1_SVD2_{suffix}.png",
                     emb2d,
                     colors=colors,
-                    title=f"{stem}: {xlab}/{ylab} colored by {title}",
-                    xlabel=xlab,
-                    ylabel=ylab,
+                    title=f"{stem}: SVD1/SVD2 colored by {title}",
+                    xlabel="SVD1",
+                    ylabel="SVD2",
                     point_size=point_size,
                 )
 
         if "p1" in meta_sub.columns:
             save_scatter(
-                image_dir / f"{stem}_{prefix}1_{prefix}2_confidence_p1.png",
+                image_dir / f"{stem}_SVD1_SVD2_confidence_p1.png",
                 emb2d,
                 values=meta_sub["p1"].to_numpy(float),
-                title=f"{stem}: {xlab}/{ylab} colored by p1",
-                xlabel=xlab,
-                ylabel=ylab,
+                title=f"{stem}: SVD1/SVD2 colored by p1",
+                xlabel="SVD1",
+                ylabel="SVD2",
                 cmap="magma",
                 point_size=point_size,
             )
         elif "compl_p1" in meta_sub.columns:
             confidence = 1 - meta_sub["compl_p1"].to_numpy(float)
             save_scatter(
-                image_dir / f"{stem}_{prefix}1_{prefix}2_confidence.png",
+                image_dir / f"{stem}_SVD1_SVD2_confidence.png",
                 emb2d,
                 values=confidence,
-                title=f"{stem}: {xlab}/{ylab} colored by confidence",
-                xlabel=xlab,
-                ylabel=ylab,
+                title=f"{stem}: SVD1/SVD2 colored by confidence",
+                xlabel="SVD1",
+                ylabel="SVD2",
                 cmap="magma",
                 point_size=point_size,
             )
 
         if "cluster" in meta_sub.columns:
             save_scatter(
-                image_dir / f"{stem}_{prefix}1_{prefix}2_cluster_id.png",
+                image_dir / f"{stem}_SVD1_SVD2_cluster_id.png",
                 emb2d,
                 values=meta_sub["cluster"].to_numpy(float),
-                title=f"{stem}: {xlab}/{ylab} colored by cluster id",
-                xlabel=xlab,
-                ylabel=ylab,
+                title=f"{stem}: SVD1/SVD2 colored by cluster id",
+                xlabel="SVD1",
+                ylabel="SVD2",
                 cmap="tab20",
                 point_size=point_size,
             )
-
-
-def plot_for_method(
-    cfg: BGMConfig,
-    method: str,
-    k_values: list[int],
-    settings: dict,
-) -> None:
-    cache_file = cache_file_for(cfg, method)
-    if not cache_file.exists():
-        raise FileNotFoundError(f"Cache not found: {cache_file}")
-
-    print(f"Loading {method.upper()} cache: {cache_file}", flush=True)
-    data = np.load(cache_file, allow_pickle=True)
-    X_norm = data["X_norm"].astype(np.float32, copy=False)
-    good_bin_ids = data["good_bin_ids"].astype(np.int64)
-    pos = data["pos"].astype(np.float32, copy=False)
-
-    for k in k_values:
-        plot_for_k(cfg, method, int(k), X_norm, good_bin_ids, pos, settings)
-
-    data.close()
-    del data, X_norm, good_bin_ids, pos
-    gc.collect()
 
 
 def main() -> None:
@@ -334,12 +319,25 @@ def main() -> None:
     if args.point_size is not None:
         settings["point_size"] = args.point_size
 
-    k_values = [args.k] if args.k is not None else cfg.k_list
-    methods = bgm_methods_from_config(cfg)
-    print(f"Selected embedding methods: {methods}", flush=True)
+    cache_file = cache_file_for(cfg)
+    if not cache_file.exists():
+        raise FileNotFoundError(f"Cache not found: {cache_file}")
 
-    for method in methods:
-        plot_for_method(cfg, method, k_values, settings)
+    print(f"Loading SVD cache: {cache_file}", flush=True)
+    data = np.load(cache_file, allow_pickle=True)
+    X_norm = data["X_norm"].astype(np.float32, copy=False)
+    good_bin_ids = data["good_bin_ids"].astype(np.int64)
+    pos = data["pos"].astype(np.float32, copy=False)
+
+    k_values = [args.k] if args.k is not None else sorted([int(k) for k in cfg.k_list])
+    k_bgm = shared_k_bgm(cfg)
+
+    for k in k_values:
+        plot_for_k(cfg, int(k), k_bgm, X_norm, good_bin_ids, pos, settings)
+
+    data.close()
+    del data, X_norm, good_bin_ids, pos
+    gc.collect()
 
     print("Done.", flush=True)
 

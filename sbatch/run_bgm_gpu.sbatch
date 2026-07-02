@@ -3,16 +3,16 @@
 #SBATCH --gpus-per-node=V100:1
 #SBATCH --cpus-per-task=8
 #SBATCH -t 0-01:00:00
-#SBATCH -o bgm_gpu_svd.%j.out
-#SBATCH -e bgm_gpu_svd.%j.err
+#SBATCH -o bgm_gpu.%j.out
+#SBATCH -e bgm_gpu.%j.err
 
 set -euo pipefail
 
 WORKDIR=/mimer/NOBACKUP/groups/digital_pathology/bayesian_clustering
 IMAGE=${WORKDIR}/bgm-gpu_v1.sif
-CONFIG=/workspace/configs/mousexeniumniche_diffseed.json
+CONFIG=/workspace/configs/mousexeniumniche.json
 
 apptainer exec --nv \
     --bind ${WORKDIR}:/workspace \
     ${IMAGE} \
-    bash -lc "cd /workspace && python -u /workspace/run_bgm_gpu.py --config ${CONFIG}"
+    bash -lc "cd /workspace && export PYTHONPATH=/workspace && python -u /workspace/run_bgm_gpu.py --config ${CONFIG}"

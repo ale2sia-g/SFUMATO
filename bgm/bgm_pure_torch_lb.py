@@ -27,7 +27,7 @@ import warnings
 import numpy as np
 import torch
 
-from bgm_torch_ops import (
+from .bgm_torch_ops import (
     estimate_log_prob_diag,
     estimate_log_prob_full,
     estimate_log_prob_spherical,
@@ -38,7 +38,7 @@ from bgm_torch_ops import (
     m_step_spherical,
     to_tensor,
 )
-from memory_utils import resolve_batch_size, iter_batches
+from .memory_utils import resolve_batch_size, iter_batches
 
 
 class BayesianGaussianMixtureTorch:

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Plot UMAP representations from preprocessing caches and BGM bin CSVs."""
+"""Plot UMAP representations from the SFUMATO SVD cache and BGM bin CSVs."""
 
 from __future__ import annotations
-import gc
+
 import argparse
+import gc
 from pathlib import Path
 
 import matplotlib
@@ -15,7 +16,6 @@ import pandas as pd
 
 from utils_bgm import (
     BGMConfig,
-    bgm_methods_from_config,
     bgm_stem_for,
     cache_file_for,
     image_dir_for,
@@ -52,6 +52,10 @@ def load_umap():
     return umap
 
 
+def shared_k_bgm(cfg: BGMConfig) -> int:
+    return int(np.ceil(cfg.bgm_oversample * max(int(k) for k in cfg.k_list)))
+
+
 def read_bin_metadata(bin_csv: Path | None) -> pd.DataFrame | None:
     if bin_csv is None or not bin_csv.exists():
         print("No matching bin-level CSV found. Plotting UMAP without cluster colors.")
@@ -86,9 +90,9 @@ def choose_indices(
 
     if meta is not None and "cluster" in meta.columns:
         idx_parts = []
-        per_cluster_min = 500
         cluster_values = meta["cluster"].to_numpy()
-        clusters = pd.unique(meta["cluster"])
+        clusters = pd.unique(meta["cluster"].dropna())
+        per_cluster_min = 500
         base = max(per_cluster_min, max_points // max(len(clusters), 1))
 
         for cluster in clusters:
@@ -98,15 +102,18 @@ def choose_indices(
             keep = min(len(idx_c), base)
             idx_parts.append(rng.choice(idx_c, size=keep, replace=False))
 
-        idx = np.unique(np.concatenate(idx_parts))
-        if len(idx) > max_points:
-            idx = rng.choice(idx, size=max_points, replace=False)
-        elif len(idx) < max_points:
-            remaining = np.setdiff1d(np.arange(n), idx, assume_unique=False)
-            add_n = min(len(remaining), max_points - len(idx))
-            if add_n > 0:
-                idx = np.concatenate([idx, rng.choice(remaining, size=add_n, replace=False)])
-        return np.sort(idx)
+        if idx_parts:
+            idx = np.unique(np.concatenate(idx_parts))
+            if len(idx) > max_points:
+                idx = rng.choice(idx, size=max_points, replace=False)
+            elif len(idx) < max_points:
+                remaining = np.setdiff1d(np.arange(n), idx, assume_unique=False)
+                add_n = min(len(remaining), max_points - len(idx))
+                if add_n > 0:
+                    idx = np.concatenate(
+                        [idx, rng.choice(remaining, size=add_n, replace=False)]
+                    )
+            return np.sort(idx)
 
     return np.sort(rng.choice(n, size=max_points, replace=False))
 
@@ -121,9 +128,15 @@ def save_scatter(
     point_size: float = 0.35,
 ) -> None:
     fig, ax = plt.subplots(figsize=(8, 7), dpi=220)
+
     if colors is not None:
         ax.scatter(
-            emb2d[:, 0], emb2d[:, 1], c=colors, s=point_size, linewidths=0, alpha=0.85
+            emb2d[:, 0],
+            emb2d[:, 1],
+            c=colors,
+            s=point_size,
+            linewidths=0,
+            alpha=0.85,
         )
     elif values is not None:
         sc = ax.scatter(
@@ -152,29 +165,27 @@ def save_scatter(
 
 def plot_for_k(
     cfg: BGMConfig,
-    method: str,
     k: int,
+    k_bgm: int,
     X_norm: np.ndarray,
     good_bin_ids: np.ndarray,
     pos: np.ndarray,
     umap_settings: dict,
 ) -> None:
-    outdir = result_dir_for(cfg, k, method)
-    image_dir = image_dir_for(cfg, k, method)
+    outdir = result_dir_for(cfg, k)
+    image_dir = image_dir_for(cfg, k)
     image_dir.mkdir(parents=True, exist_ok=True)
 
-    stem = bgm_stem_for(cfg, k, method)
+    stem = bgm_stem_for(cfg, k, k_bgm)
     bin_csv = outdir / f"{stem}_binlevel_FULL.csv"
+
     meta = read_bin_metadata(bin_csv)
     if meta is not None:
         meta = meta.set_index("bin_id").reindex(good_bin_ids).reset_index()
 
     max_points = int(umap_settings.get("max_points", 200000))
     idx = choose_indices(X_norm.shape[0], max_points, cfg.seed, meta)
-    print(
-        f"{method.upper()} K={k}: using {len(idx):,} / {X_norm.shape[0]:,} bins for UMAP",
-        flush=True,
-    )
+    print(f"K={k}: using {len(idx):,} / {X_norm.shape[0]:,} bins for UMAP", flush=True)
 
     X_sub = X_norm[idx]
     pos_sub = pos[idx]
@@ -215,6 +226,7 @@ def plot_for_k(
     print(f"Saved: {csv_out}", flush=True)
 
     point_size = float(umap_settings.get("point_size", 0.35))
+
     save_scatter(
         image_dir / f"{stem}_umap_plain.png",
         emb2d,
@@ -240,6 +252,7 @@ def plot_for_k(
         cmap="viridis",
         point_size=point_size,
     )
+
     save_scatter(
         image_dir / f"{stem}_umap_spatial_y.png",
         emb2d,
@@ -296,30 +309,6 @@ def plot_for_k(
             )
 
 
-def plot_for_method(
-    cfg: BGMConfig,
-    method: str,
-    k_values: list[int],
-    umap_settings: dict,
-) -> None:
-    cache_file = cache_file_for(cfg, method)
-    if not cache_file.exists():
-        raise FileNotFoundError(f"Cache not found: {cache_file}")
-
-    print(f"Loading {method.upper()} cache: {cache_file}", flush=True)
-    data = np.load(cache_file, allow_pickle=True)
-    X_norm = data["X_norm"].astype(np.float32, copy=False)
-    good_bin_ids = data["good_bin_ids"].astype(np.int64)
-    pos = data["pos"].astype(np.float32, copy=False)
-
-    for k in k_values:
-        plot_for_k(cfg, method, int(k), X_norm, good_bin_ids, pos, umap_settings)
-
-    data.close()
-    del data, X_norm, good_bin_ids, pos
-    gc.collect()
-
-
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
@@ -331,12 +320,25 @@ def main() -> None:
         if value is not None:
             umap_settings[key] = value
 
-    k_values = [args.k] if args.k is not None else cfg.k_list
-    methods = bgm_methods_from_config(cfg)
-    print(f"Selected UMAP reduction methods: {methods}", flush=True)
+    cache_file = cache_file_for(cfg)
+    if not cache_file.exists():
+        raise FileNotFoundError(f"Cache not found: {cache_file}")
 
-    for method in methods:
-        plot_for_method(cfg, method, k_values, umap_settings)
+    print(f"Loading SVD cache: {cache_file}", flush=True)
+    data = np.load(cache_file, allow_pickle=True)
+    X_norm = data["X_norm"].astype(np.float32, copy=False)
+    good_bin_ids = data["good_bin_ids"].astype(np.int64)
+    pos = data["pos"].astype(np.float32, copy=False)
+
+    k_values = [args.k] if args.k is not None else sorted([int(k) for k in cfg.k_list])
+    k_bgm = shared_k_bgm(cfg)
+
+    for k in k_values:
+        plot_for_k(cfg, int(k), k_bgm, X_norm, good_bin_ids, pos, umap_settings)
+
+    data.close()
+    del data, X_norm, good_bin_ids, pos
+    gc.collect()
 
     print("Done.", flush=True)
 

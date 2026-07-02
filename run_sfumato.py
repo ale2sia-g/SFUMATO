@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Run SFUMATO preprocessing followed by GPU BGM from one shared config.
 
-If preprocess.use_svd and preprocess.use_pca are both true, preprocessing
-creates both caches and BGM runs on both embeddings.
+The preprocessing step creates one sparse-SVD cache. The GPU step fits one
+oversampled BGM using max(K_LIST), builds a shared component dendrogram, and
+cuts it at all requested K values.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--force-preprocess",
         action="store_true",
-        help="Overwrite existing preprocessing caches.",
+        help="Overwrite existing preprocessing cache.",
     )
     return parser.parse_args()
 

@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""GPU BGM clustering on preprocessed SFUMATO embeddings."""
+"""GPU BGM clustering on preprocessed SFUMATO SVD embeddings.
+
+This version fits one oversampled BGM using max(K_LIST), builds one shared
+component dendrogram, and obtains all requested K values by cutting the same
+dendrogram. Cluster colors are assigned from the shared dendrogram ordering.
+"""
 
 from __future__ import annotations
 
@@ -14,32 +19,32 @@ import numpy as np
 import pandas as pd
 
 from scipy.cluster.hierarchy import fcluster, linkage
-from sklearn.decomposition import PCA
 
-from bgm_pure_torch_lb import BayesianGaussianMixtureTorch
+from bgm.bgm_pure_torch_lb import BayesianGaussianMixtureTorch
 from utils_bgm import (
     BGMConfig,
-    bgm_methods_from_config,
     bgm_stem_for,
     cache_file_for,
-    centroids_to_hsv_rgb,
+    cluster_color_table,
     color_mix_top2_log,
-    combined_merge_distance,
+    colors_for_cut,
     csv_to_h5ad,
+    get_continuous_colormap_func,
     get_p2r_from_cache,
-    has_rare_groups,
     image_dir_for,
-    load_json_cache_field,
-    load_rare_group_names,
+    leaf_rank_from_linkage,
     merge_centroids_by_groups,
     merge_probabilities_from_labels,
-    plot_final_dendrogram_with_colors,
-    plot_oversampled_dendrogram,
-    plot_rare_group_heatmaps,
-    rare_group_soft_means,
+    normalize_condensed,
+    plot_cut_dendrogram,
+    plot_multiresolution_dendrogram,
     result_dir_for,
     rgb01_to_hex,
+    safe_cosine_pdist,
     save_json,
+    shared_bgm_stem_for,
+    shared_image_dir_for,
+    shared_result_dir_for,
     soft_cluster_centroids,
     top2_from_proba,
 )
@@ -52,29 +57,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_cache_for_method(cfg: BGMConfig, method: str):
-    cache_file = cache_file_for(cfg, method)
+def load_cache(cfg: BGMConfig) -> dict:
+    cache_file = cache_file_for(cfg)
     if not cache_file.exists():
         raise FileNotFoundError(f"Cache not found: {cache_file}. Run preprocess first.")
 
-    print(f"Loading {method.upper()} cache from {cache_file}...", flush=True)
+    print(f"Loading cache from {cache_file}...", flush=True)
     data = np.load(cache_file, allow_pickle=True)
-
-    rare_group_names = load_rare_group_names(data)
-    rare_group_genes = load_json_cache_field(data, "rare_group_genes_json")
-    rare_group_genes_present = load_json_cache_field(
-        data,
-        "rare_group_genes_present_json",
-    )
 
     payload = {
         "cache_file": cache_file,
         "data": data,
         "X_norm": data["X_norm"],
-        "X_rare": data["X_rare"],
-        "rare_group_names": rare_group_names,
-        "rare_group_genes": rare_group_genes,
-        "rare_group_genes_present": rare_group_genes_present,
         "good_bin_ids": data["good_bin_ids"],
         "pos": data["pos"],
         "back_map": data["back_map"],
@@ -85,18 +79,13 @@ def load_cache_for_method(cfg: BGMConfig, method: str):
     }
 
     print(f"  X_norm: {payload['X_norm'].shape}", flush=True)
-    print(f"  X_rare: {payload['X_rare'].shape}", flush=True)
-    print(f"  Rare groups: {list(rare_group_names)}", flush=True)
-
     return payload
 
 
-def save_merge_distances(
+def save_oversampled_merge_distances(
     outdir,
     stem: str,
-    d_comb: np.ndarray,
     d_all: np.ndarray,
-    d_rare: np.ndarray | None,
 ) -> None:
     """
     Save condensed pairwise merge distances between oversampled BGM components.
@@ -108,6 +97,7 @@ def save_merge_distances(
         return
 
     n_components = int((1 + np.sqrt(1 + 8 * n_pairs)) / 2)
+
     rows = []
     idx = 0
     for i in range(n_components - 1):
@@ -117,8 +107,6 @@ def save_merge_distances(
                     "component_i": i,
                     "component_j": j,
                     "d_all": float(d_all[idx]),
-                    "d_rare": float(d_rare[idx]) if d_rare is not None else np.nan,
-                    "d_comb": float(d_comb[idx]),
                 }
             )
             idx += 1
@@ -128,16 +116,37 @@ def save_merge_distances(
     print(f"  Saved {path}", flush=True)
 
 
-def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
-    payload = load_cache_for_method(cfg, method)
+def first_svd_dims(X_norm: np.ndarray, n_dims: int = 3) -> np.ndarray:
+    """
+    Return first SVD dimensions padded to n_dims.
+
+    These are saved for downstream inspection. They are not used for color
+    assignment.
+    """
+    out = np.zeros((X_norm.shape[0], n_dims), dtype=np.float32)
+    n = min(n_dims, X_norm.shape[1])
+    out[:, :n] = X_norm[:, :n]
+    return out
+
+
+def run_bgm(config: dict) -> None:
+    import torch
+
+    print(f"CUDA available: {torch.cuda.is_available()}", flush=True)
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
+    else:
+        raise SystemExit("CUDA is required for BGM.")
+
+    cfg = BGMConfig.from_dict(config)
+    if cfg.merge_metric != "cosine":
+        raise ValueError("Only merge_metric='cosine' is currently implemented.")
+
+    payload = load_cache(cfg)
 
     cache_file = payload["cache_file"]
     data = payload["data"]
     X_norm = payload["X_norm"]
-    X_rare = payload["X_rare"]
-    rare_group_names = payload["rare_group_names"]
-    rare_group_genes = payload["rare_group_genes"]
-    rare_group_genes_present = payload["rare_group_genes_present"]
     good_bin_ids = payload["good_bin_ids"]
     pos = payload["pos"]
     back_map = payload["back_map"]
@@ -145,8 +154,6 @@ def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
     gene_y = payload["gene_y"]
     gene_name = payload["gene_name"]
     gene_bin_id = payload["gene_bin_id"]
-
-    has_rare = has_rare_groups(X_rare, rare_group_names)
 
     df_run = pd.DataFrame(
         {
@@ -157,13 +164,121 @@ def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
         }
     )
 
-    for k in cfg.k_list:
-        k = int(k)
-        k_bgm = int(np.ceil(cfg.bgm_oversample * k))
-        oversample = cfg.bgm_oversample > 1.0
-        stem = bgm_stem_for(cfg, k, method)
-        outdir = result_dir_for(cfg, k, method)
-        image_dir = image_dir_for(cfg, k, method)
+    k_list = sorted([int(k) for k in cfg.k_list])
+    k_max = max(k_list)
+    k_bgm = int(np.ceil(cfg.bgm_oversample * k_max))
+    oversample = cfg.bgm_oversample > 1.0
+
+    shared_stem = shared_bgm_stem_for(cfg, k_bgm, k_max)
+    shared_outdir = shared_result_dir_for(cfg)
+    shared_image_dir = shared_image_dir_for(cfg)
+    shared_outdir.mkdir(parents=True, exist_ok=True)
+    shared_image_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'=' * 60}", flush=True)
+    print("Shared BGM run", flush=True)
+    print(f"K_LIST={k_list}", flush=True)
+    print(f"K_max={k_max}", flush=True)
+    print(f"bgm_oversample={cfg.bgm_oversample}", flush=True)
+    print(f"K_bgm={k_bgm}", flush=True)
+    print(f"oversample={oversample}", flush=True)
+    print(f"Output directory: {shared_outdir}", flush=True)
+
+    print(f"BGM ({k_bgm} components, {X_norm.shape[1]} dims)...", flush=True)
+    bgm = BayesianGaussianMixtureTorch(
+        n_components=k_bgm,
+        n_init=1,
+        init_params="k-means++",
+        covariance_type="diag",
+        weight_concentration_prior_type="dirichlet_process",
+        weight_concentration_prior=cfg.bgm_weight_prior,
+        random_state=cfg.seed,
+        max_iter=1000,
+        verbose=1,
+        verbose_interval=10,
+        tol=1e-2,
+        batch_size=None,
+        device="cuda",
+    )
+    bgm.fit(X_norm)
+    proba_bgm = bgm.predict_proba(X_norm)
+
+    centroids_bgm, masses_bgm = soft_cluster_centroids(X_norm, proba_bgm)
+    print("  Using soft centroids for shared dendrogram", flush=True)
+
+    d_all = normalize_condensed(safe_cosine_pdist(centroids_bgm))
+    save_oversampled_merge_distances(shared_outdir, shared_stem, d_all)
+
+    Z_link = linkage(
+        d_all,
+        method=cfg.merge_method,
+        optimal_ordering=True,
+    )
+
+    leaf_rank = leaf_rank_from_linkage(Z_link)
+    color_func = get_continuous_colormap_func(
+        cmap_name=cfg.color_colormap,
+        start=cfg.color_colormap_start,
+        end=cfg.color_colormap_end,
+    )
+
+    color_table = cluster_color_table(Z_link, k_list, color_func)
+    color_table_file = shared_outdir / f"{shared_stem}_cluster_color_table_allK.csv"
+    color_table.to_csv(color_table_file, index=False)
+    print(f"  Saved {color_table_file}", flush=True)
+
+    plot_multiresolution_dendrogram(
+        Z=Z_link,
+        k_list=k_list,
+        color_func=color_func,
+        path=shared_image_dir / f"{shared_stem}_multiresolution_dendrogram_allK.png",
+        title=f"{shared_stem}: shared multiresolution dendrogram",
+        branch_linewidth=cfg.dendrogram_branch_linewidth,
+    )
+    print("  Saved shared multiresolution dendrogram", flush=True)
+
+    weights_file = shared_outdir / f"weights_{shared_stem}.txt"
+    with weights_file.open("w", encoding="utf-8") as f:
+        f.write("Shared oversampled BGM\n")
+        f.write(f"K_LIST={k_list}\n")
+        f.write(f"K_max={k_max}\n")
+        f.write(f"K_bgm={k_bgm}\n")
+        f.write(f"bgm_oversample={cfg.bgm_oversample}\n")
+        f.write(f"merge_method={cfg.merge_method}\n")
+        f.write(f"merge_metric={cfg.merge_metric}\n")
+        f.write(f"color_colormap={cfg.color_colormap}\n")
+        f.write(f"color_colormap_start={cfg.color_colormap_start}\n")
+        f.write(f"color_colormap_end={cfg.color_colormap_end}\n")
+        f.write("\nBGM weights:\n")
+        for i, weight in enumerate(bgm.weights_):
+            f.write(f"Component {i}: {weight}\n")
+        f.write("\nOversampled component masses:\n")
+        for j, mass in enumerate(masses_bgm):
+            f.write(f"Component {j}: {mass}\n")
+    print(f"  Saved {weights_file}", flush=True)
+
+    save_json(
+        shared_outdir / f"{shared_stem}_shared_bgm_config.json",
+        {
+            "run_name": cfg.run_name,
+            "K_LIST": k_list,
+            "K_max": k_max,
+            "K_bgm": k_bgm,
+            "cache_file": str(cache_file),
+            "output_directory": str(shared_outdir),
+            "bgm": config.get("bgm", {}),
+            "preprocess": config.get("preprocess", {}),
+            "color": config.get("color", {}),
+            "save_transcript_proba": cfg.save_transcript_proba,
+        },
+    )
+
+    X_svd3 = first_svd_dims(X_norm, n_dims=3)
+
+    for k in k_list:
+        stem = bgm_stem_for(cfg, k, k_bgm)
+        outdir = result_dir_for(cfg, k)
+        image_dir = image_dir_for(cfg, k)
         outdir.mkdir(parents=True, exist_ok=True)
         image_dir.mkdir(parents=True, exist_ok=True)
 
@@ -172,138 +287,47 @@ def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
         outfile_proba = outdir / f"{stem}_transcripts_proba_FULL.csv"
 
         print(f"\n{'=' * 60}", flush=True)
-        print(f"Reduction method={method.upper()}", flush=True)
-        print(f"K={k}, K_bgm={k_bgm}, oversample={oversample}", flush=True)
-        print(f"beta_rare={cfg.beta_rare}", flush=True)
-        print(f"Rare groups available={has_rare}", flush=True)
+        print(f"Cutting shared dendrogram to K={k}", flush=True)
         print(f"Output directory: {outdir}", flush=True)
 
-        has_p2r = cfg.save_p2r
-        if has_p2r:
-            cluster_p2r_bins, p2r_color_bins = get_p2r_from_cache(data, k)
+        merge_labels = fcluster(Z_link, t=k, criterion="maxclust")
+        unique_merge_labels = np.unique(merge_labels)
+        proba, groups = merge_probabilities_from_labels(proba_bgm, merge_labels)
 
-        print(f"BGM ({k_bgm} components, {X_norm.shape[1]} dims)...", flush=True)
-        bgm = BayesianGaussianMixtureTorch(
-            n_components=k_bgm,
-            n_init=1,
-            init_params="k-means++",
-            covariance_type="diag",
-            weight_concentration_prior_type="dirichlet_process",
-            weight_concentration_prior=cfg.bgm_weight_prior,
-            random_state=cfg.seed,
-            max_iter=1000,
-            verbose=1,
-            verbose_interval=10,
-            tol=1e-2,
-            batch_size=None,
-            device="cuda",
-        )
-        bgm.fit(X_norm)
-        proba = bgm.predict_proba(X_norm)
-
-        centroids_soft, masses = soft_cluster_centroids(X_norm, proba)
-        centroids_for_merge = centroids_soft
-
-        if has_rare:
-            centroids_rare_soft, _ = soft_cluster_centroids(X_rare, proba)
-            centroids_rare_for_merge = centroids_rare_soft
-        else:
-            centroids_rare_soft = None
-            centroids_rare_for_merge = None
-
-        print("  Using soft centroids", flush=True)
-
-        Z_link = None
-        d_all = None
-        d_rare = None
-        d_comb = None
-
-        if oversample:
-            print(f"Merging {proba.shape[1]} -> {k} clusters...", flush=True)
-
-            d_comb, d_all, d_rare = combined_merge_distance(
-                centroids_all=centroids_for_merge,
-                centroids_rare=centroids_rare_for_merge,
-                beta_rare=cfg.beta_rare,
-            )
-
-            if d_rare is None:
-                print("  Rare groups not used in merge distance.", flush=True)
-            else:
-                print("  Rare groups used in merge distance.", flush=True)
-
-            save_merge_distances(
-                outdir=outdir,
-                stem=stem,
-                d_comb=d_comb,
-                d_all=d_all,
-                d_rare=d_rare,
-            )
-
-            Z_link = linkage(d_comb, method=cfg.merge_method)
-
-            plot_oversampled_dendrogram(
-                Z_link,
-                target_k=k,
-                path=image_dir / f"{stem}_oversampled_dendrogram_cut.png",
-                title=f"{stem}: oversampled BGM dendrogram cut to K={k}",
-            )
-
-            merge_labels = fcluster(Z_link, t=k, criterion="maxclust")
-            proba, groups = merge_probabilities_from_labels(proba, merge_labels)
-
-            centroids_for_merge, masses = merge_centroids_by_groups(
-                centroids_for_merge,
-                masses,
-                groups,
-            )
-
-            if centroids_rare_for_merge is not None:
-                centroids_rare_for_merge, _ = merge_centroids_by_groups(
-                    centroids_rare_for_merge,
-                    np.ones(centroids_rare_for_merge.shape[0], dtype=float),
-                    groups,
-                )
-
-            print(f"  Final clusters: {proba.shape[1]}", flush=True)
-
-        rare_scores = rare_group_soft_means(
-            X_rare=X_rare,
-            proba=proba,
-            rare_group_names=rare_group_names,
-        )
-        plot_rare_group_heatmaps(
-            rare_scores=rare_scores,
-            outdir=image_dir,
-            stem=stem,
+        centroids_final, masses_final = merge_centroids_by_groups(
+            centroids_bgm,
+            masses_bgm,
+            groups,
         )
 
-        print("PCA on final cluster centroids for colors...", flush=True)
-        pca_color = PCA(n_components=3, random_state=cfg.seed)
-        pca_color.fit(centroids_for_merge)
+        actual_k = proba.shape[1]
+        print(f"  Final clusters: {actual_k}", flush=True)
 
-        X_pca_color = pca_color.transform(X_norm)
-        means_3d = pca_color.transform(centroids_for_merge)
-        print(
-            f"  Explained variance: {pca_color.explained_variance_ratio_.sum():.3f}",
-            flush=True,
+        _, spans, colors_hex_by_label, colors_rgb_by_label = colors_for_cut(
+            Z_link,
+            k,
+            leaf_rank,
+            color_func,
         )
+
+        centroid_colors = [
+            colors_rgb_by_label[int(label)] for label in unique_merge_labels
+        ]
+        centroid_colors_hex = [
+            colors_hex_by_label[int(label)] for label in unique_merge_labels
+        ]
+
+        plot_cut_dendrogram(
+            Z=Z_link,
+            k=k,
+            color_func=color_func,
+            path=image_dir / f"{stem}_cut_dendrogram.png",
+            title=f"{stem}: shared dendrogram cut to K={k}",
+            branch_linewidth=cfg.dendrogram_branch_linewidth,
+        )
+        print(f"  Saved cut dendrogram for K={k}", flush=True)
 
         cluster, second_cluster, p1, p2 = top2_from_proba(proba)
-        rgb, hue, h_shifted, h_new = centroids_to_hsv_rgb(
-            means_3d,
-            use_hist_equalization=cfg.use_hist_equalization,
-            return_hues=True,
-        )
-        centroid_colors = [rgb[i] for i in range(rgb.shape[0])]
-
-        plot_final_dendrogram_with_colors(
-            centroids_for_merge,
-            centroid_colors,
-            image_dir / f"{stem}_final_dendrogram_colors.png",
-            title=f"{stem}: final cluster dendrogram with assigned colors",
-            method=cfg.merge_method,
-        )
 
         df_bins = pd.DataFrame(
             {
@@ -315,18 +339,19 @@ def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
                 "p1": p1,
                 "p2": p2,
                 "compl_p1": 1 - p1,
-                "PC1": X_pca_color[:, 0],
-                "PC2": X_pca_color[:, 1],
-                "PC3": X_pca_color[:, 2],
+                "PC1": X_svd3[:, 0],
+                "PC2": X_svd3[:, 1],
+                "PC3": X_svd3[:, 2],
             }
         )
+
         df_bins["color_hard_hsv"] = df_bins["cluster"].apply(
-            lambda c: rgb01_to_hex(centroid_colors[c])
+            lambda c: centroid_colors_hex[int(c)]
         )
         df_bins["color_log_hsv"] = df_bins.apply(
             lambda row: color_mix_top2_log(
-                centroid_colors[row["cluster"]],
-                centroid_colors[row["second_cluster"]],
+                centroid_colors[int(row["cluster"])],
+                centroid_colors[int(row["second_cluster"])],
                 row["p1"],
                 row["p2"],
                 alpha=50.0,
@@ -334,7 +359,8 @@ def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
             axis=1,
         )
 
-        if has_p2r:
+        if cfg.save_p2r:
+            cluster_p2r_bins, p2r_color_bins = get_p2r_from_cache(data, k)
             df_bins["color_p2r"] = p2r_color_bins[good_bin_ids]
             df_bins["cluster_p2r"] = cluster_p2r_bins[good_bin_ids]
 
@@ -359,7 +385,7 @@ def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
             df_mappedback["cluster"].fillna(-1).astype(int).astype("category")
         )
 
-        if has_p2r:
+        if cfg.save_p2r:
             cluster_p2r_transcripts = cluster_p2r_bins[back_map]
             df_mappedback["cluster_p2r"] = cluster_p2r_transcripts
             df_mappedback["cluster_p2r"] = df_mappedback["cluster_p2r"].astype("category")
@@ -367,17 +393,22 @@ def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
 
         df_colors = pd.DataFrame(
             {
-                "cluster": np.arange(len(hue)),
-                "hue_raw": hue,
-                "hue_rotated": h_shifted,
-                "hue_equalized": h_new,
-                "color_hex": [rgb01_to_hex(c) for c in rgb],
+                "cluster": np.arange(actual_k),
+                "merge_label": unique_merge_labels.astype(int),
+                "color_hex": centroid_colors_hex,
+                "n_oversampled_components": [
+                    len(spans[int(label)]["members"]) for label in unique_merge_labels
+                ],
+                "oversampled_components": [
+                    ",".join(str(int(x)) for x in spans[int(label)]["members"])
+                    for label in unique_merge_labels
+                ],
             }
         )
 
-        hues_file = outdir / f"hues_{stem}.csv"
-        df_colors.to_csv(hues_file, index=False)
-        print(f"  Saved {hues_file}", flush=True)
+        colors_file = outdir / f"colors_{stem}.csv"
+        df_colors.to_csv(colors_file, index=False)
+        print(f"  Saved {colors_file}", flush=True)
 
         adata_output = csv_to_h5ad(df_mappedback)
         adata_output.write_h5ad(outfile_h5ad)
@@ -386,33 +417,36 @@ def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
         df_bins.to_csv(outfile_bins, index=False)
         print(f"  Saved {outfile_bins}", flush=True)
 
-        weights_file = outdir / f"weights_{stem}.txt"
-        with weights_file.open("w", encoding="utf-8") as f:
-            f.write(f"Reduction method={method.upper()}\n")
-            f.write(f"K={k}, K_bgm={k_bgm}\n")
-            f.write(f"beta_rare={cfg.beta_rare}\n")
-            f.write(f"rare_groups_available={has_rare}\n")
-            f.write(f"rare_groups_used_in_merge={d_rare is not None}\n")
-            f.write(f"rare_group_names={list(rare_group_names)}\n")
-            f.write(f"rare_group_genes={rare_group_genes}\n")
-            f.write(f"rare_group_genes_present={rare_group_genes_present}\n")
-            f.write("\nBGM weights:\n")
-            for i, weight in enumerate(bgm.weights_):
-                f.write(f"Component {i}: {weight}\n")
-            f.write("\nCluster masses:\n")
-            for j, mass in enumerate(masses):
+        weights_k_file = outdir / f"weights_{stem}.txt"
+        with weights_k_file.open("w", encoding="utf-8") as f:
+            f.write("Shared BGM cut\n")
+            f.write(f"K={k}\n")
+            f.write(f"actual_K={actual_k}\n")
+            f.write(f"K_bgm={k_bgm}\n")
+            f.write(f"bgm_oversample={cfg.bgm_oversample}\n")
+            f.write(f"shared_stem={shared_stem}\n")
+            f.write(f"color_colormap={cfg.color_colormap}\n")
+            f.write(f"color_colormap_start={cfg.color_colormap_start}\n")
+            f.write(f"color_colormap_end={cfg.color_colormap_end}\n")
+            f.write("\nFinal cluster masses:\n")
+            for j, mass in enumerate(masses_final):
                 f.write(f"Cluster {j}: {mass}\n")
-        print(f"  Saved {weights_file}", flush=True)
+            f.write("\nCluster colors:\n")
+            for j, color in enumerate(centroid_colors_hex):
+                f.write(f"Cluster {j}: {color}\n")
+        print(f"  Saved {weights_k_file}", flush=True)
 
         if cfg.save_transcript_proba:
             print("Saving transcript-level probability CSV...", flush=True)
             n_clusters_final = proba.shape[1]
             transcript_bin_ids = df_run["bin_id"].to_numpy()
+
             n_bins_total = (
                 int(data["n_bins_total"][0])
                 if "n_bins_total" in data
                 else int(transcript_bin_ids.max()) + 1
             )
+
             bin_id_to_row = np.full(n_bins_total, -1, dtype=np.int32)
             bin_id_to_row[good_bin_ids] = np.arange(len(good_bin_ids), dtype=np.int32)
             transcript_proba_rows = bin_id_to_row[transcript_bin_ids]
@@ -436,6 +470,7 @@ def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
                     "color_log_hsv": df_mappedback["color_log_hsv"].to_numpy(),
                 }
             )
+
             for cluster_idx in range(n_clusters_final):
                 df_proba[f"p{cluster_idx + 1}"] = proba_transcripts[:, cluster_idx]
 
@@ -445,6 +480,7 @@ def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
                 f"{n_clusters_final} clusters",
                 flush=True,
             )
+
             del df_proba, proba_transcripts, bin_id_to_row, transcript_proba_rows
             gc.collect()
         else:
@@ -454,70 +490,37 @@ def run_bgm_for_method(config: dict, cfg: BGMConfig, method: str) -> None:
             outdir / f"{stem}_bgm_config.json",
             {
                 "run_name": cfg.run_name,
-                "reduction_method": method.upper(),
                 "K": k,
+                "actual_K": actual_k,
                 "K_bgm": k_bgm,
+                "shared_stem": shared_stem,
                 "cache_file": str(cache_file),
                 "output_directory": str(outdir),
+                "shared_output_directory": str(shared_outdir),
                 "bgm": config.get("bgm", {}),
                 "preprocess": config.get("preprocess", {}),
+                "color": config.get("color", {}),
                 "save_transcript_proba": cfg.save_transcript_proba,
-                "beta_rare": cfg.beta_rare,
-                "rare_groups_available": has_rare,
-                "rare_groups_used_in_merge": d_rare is not None,
-                "rare_group_names": [str(x) for x in rare_group_names],
-                "rare_group_genes": rare_group_genes,
-                "rare_group_genes_present": rare_group_genes_present,
             },
         )
 
-        del bgm, proba, centroids_soft
-        del centroids_for_merge, masses
-        del pca_color, X_pca_color, means_3d
-        del cluster, second_cluster, p1, p2, rgb, hue, h_shifted, h_new
-        del centroid_colors, df_bins, df_mappedback, df_colors, adata_output
-        del rare_scores
-        if centroids_rare_soft is not None:
-            del centroids_rare_soft
-        if centroids_rare_for_merge is not None:
-            del centroids_rare_for_merge
-        if Z_link is not None:
-            del Z_link
-        if d_all is not None:
-            del d_all
-        if d_rare is not None:
-            del d_rare
-        if d_comb is not None:
-            del d_comb
+        del proba, groups, centroids_final, masses_final
+        del merge_labels, unique_merge_labels
+        del centroid_colors, centroid_colors_hex
+        del cluster, second_cluster, p1, p2
+        del df_bins, df_mappedback, df_colors, adata_output
+        if cfg.save_p2r:
+            del cluster_p2r_bins, p2r_color_bins
         gc.collect()
-        print(f"  Done {method.upper()} K={k}", flush=True)
+        print(f"  Done K={k}", flush=True)
 
     data.close()
-    del data, X_norm, X_rare, rare_group_names
-    del rare_group_genes, rare_group_genes_present
+
+    del data, X_norm, X_svd3, proba_bgm, bgm
+    del centroids_bgm, masses_bgm, d_all, Z_link, color_table
     del good_bin_ids, pos, back_map
     del gene_x, gene_y, gene_name, gene_bin_id, df_run
     gc.collect()
-
-
-def run_bgm(config: dict) -> None:
-    import torch
-
-    print(f"CUDA available: {torch.cuda.is_available()}", flush=True)
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
-    else:
-        raise SystemExit("CUDA is required for BGM.")
-
-    cfg = BGMConfig.from_dict(config)
-    if cfg.merge_metric != "cosine":
-        raise ValueError("Only merge_metric='cosine' is currently implemented.")
-
-    methods = bgm_methods_from_config(cfg)
-    print(f"Selected BGM reduction methods: {methods}", flush=True)
-
-    for method in methods:
-        run_bgm_for_method(config, cfg, method)
 
 
 def main() -> None:

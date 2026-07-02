@@ -15,9 +15,56 @@
 ---
 
 SFUMATO is a Bayesian probabilistic clustering and visualisation pipeline for spatial transcriptomics.
-It uses spatial binning, dimensionality reduction, and Bayesian Gaussian mixture modelling to identify spatial niches while preserving uncertainty information and enabling interpretable colour-based visualisation.
+It uses spatial binning, sparse dimensionality reduction, and Bayesian Gaussian mixture modelling to identify spatial niches while preserving uncertainty information and enabling interpretable colour-based visualisation.
 
 The pipeline is config-driven: the same config file is used for CPU preprocessing, GPU BGM clustering, local runs, optional UMAP/embedding plots, and Alvis SLURM jobs.
+
+## Repository Structure
+
+Recommended structure:
+
+```text
+SFUMATO/
+  bgm/
+    __init__.py
+    bgm_pure_torch_lb.py
+    bgm_torch_ops.py
+    memory_utils.py
+
+  configs/
+    mousexeniumniche.json
+
+  sbatch/
+    preprocess.sbatch
+    run_bgm_gpu.sbatch
+    submit_pipeline.sh
+
+  transcripts_files/
+    xenium_mouse.csv
+
+  notebooks/
+  assets/
+
+  points2regions.py
+  preprocess.py
+  run_bgm_gpu.py
+  run_sfumato.py
+  utils_bgm.py
+  utils_config.py
+  utils_preprocess.py
+```
+
+Transcript-level input files should be placed in:
+
+```text
+transcripts_files/
+```
+
+For example:
+
+```json
+"input_csv": "transcripts_files/xenium_mouse.csv"
+```
 
 ## Main Config
 
@@ -32,11 +79,11 @@ The config controls:
 - dataset name and input CSV
 - coordinate/gene column names
 - binning and smoothing parameters
-- dimensionality reduction method, SVD and/or PCA
-- BGM cluster numbers
+- sparse SVD dimensionality reduction
+- BGM cluster resolutions
 - optional P2R clustering
-- optional rare marker groups
 - output directories
+- hierarchical colour assignment
 - optional UMAP settings
 
 Example structure:
@@ -44,7 +91,7 @@ Example structure:
 ```json
 {
   "run_name": "mousexeniumniche",
-  "input_csv": "xenium_mouse.csv",
+  "input_csv": "transcripts_files/xenium_mouse.csv",
   "columns": {
     "x": "x",
     "y": "y",
@@ -58,22 +105,23 @@ Example structure:
     "bin_width": 40,
     "factor": 8,
     "seed": 8,
-    "use_svd": true,
-    "use_pca": true,
     "comp": 10,
     "save_p2r": true,
     "alpha": 1.0,
-    "rare_genes": null,
     "cache_dir": "preprocess_cache_mousexeniumniche"
   },
   "bgm": {
     "outroot": "results_mousexeniumniche",
     "save_transcript_proba": false,
-    "beta_rare": 0.0,
     "merge_method": "complete",
     "merge_metric": "cosine",
-    "bgm_weight_prior": 1,
-    "use_hist_equalization": true
+    "bgm_weight_prior": 1
+  },
+  "color": {
+    "colormap": "gist_ncar",
+    "colormap_start": 0.08,
+    "colormap_end": 0.92,
+    "dendrogram_branch_linewidth": 3.0
   },
   "umap": {
     "run": false,
@@ -86,112 +134,111 @@ Example structure:
 }
 ```
 
-## SVD and PCA
+## Preprocessing
 
-Dimensionality reduction is controlled by:
+Preprocessing runs a Points2Regions-style feature extraction step followed by sparse TruncatedSVD.
+
+The main preprocessing parameters are:
 
 ```json
-"use_svd": true,
-"use_pca": true,
+"bin_width": 40,
+"factor": 8,
+"min_genes_per_bin": 120,
 "comp": 10
 ```
 
-If both `use_svd` and `use_pca` are `true`, preprocessing runs points2regions once and then writes two separate caches:
+The output cache contains:
 
 ```text
-preprocess_cache_mousexeniumniche_svd/
-preprocess_cache_mousexeniumniche_pca/
+X_norm        sparse-SVD embedding used by BGM
+good_bin_ids  bin ids retained after filtering
+pos           spatial bin coordinates
+back_map      transcript-to-bin mapping
+gene_x/y      transcript coordinates
+gene_name     transcript gene labels
+gene_bin_id   transcript bin ids
 ```
 
-BGM then runs separately on each enabled representation and writes method-specific results:
+Sparse SVD is used instead of dense PCA because spatial transcriptomics bin-by-gene matrices are typically sparse and can be too large to densify.
+
+## Shared Multi-Resolution BGM
+
+SFUMATO fits one oversampled Bayesian Gaussian mixture model using the largest requested K:
 
 ```text
-results_mousexeniumniche_svd/
-results_mousexeniumniche_pca/
+K_max = max(k_list)
+K_bgm = ceil(bgm_oversample * K_max)
 ```
 
-For large or very fine-bin datasets, PCA may require much more RAM because it densifies the sparse matrix. SVD is the safer default for large sparse spatial transcriptomics inputs.
-
-## Rare Marker Groups
-
-Rare marker genes can optionally be provided as named marker groups:
+For example, if:
 
 ```json
-"rare_genes": {
-  "celltype_A": ["Gene1"],
-  "celltype_B": ["Gene2", "Gene3"],
-  "celltype_C": ["Gene4", "Gene5", "Gene6"]
+"k_list": [15, 20, 25, 30],
+"bgm_oversample": 1.5
+```
+
+then:
+
+```text
+K_max = 30
+K_bgm = 45
+```
+
+The GPU step then:
+
+1. fits one BGM with `K_bgm` components;
+2. computes soft centroids for the oversampled components;
+3. builds one shared hierarchical dendrogram of the oversampled components;
+4. cuts the same dendrogram at each requested K;
+5. saves one set of outputs for each K.
+
+This ensures that different K resolutions are derived from the same model and the same dendrogram.
+
+## Hierarchical Colour Assignment
+
+SFUMATO assigns cluster colours from the shared dendrogram ordering.
+
+The default colour ramp is:
+
+```json
+"color": {
+  "colormap": "gist_ncar",
+  "colormap_start": 0.08,
+  "colormap_end": 0.92
 }
 ```
 
-If `rare_genes` is `null` or `{}`, no fallback gene is selected. The rare-gene matrix is saved as an empty matrix with shape:
+This uses a trimmed `gist_ncar` colormap to avoid the darkest and most extreme endpoints while preserving a broad range of distinguishable colours.
 
-```text
-n_bins x 0
-```
+For each K:
 
-This preserves the ordinary SFUMATO flow exactly when rare genes are not used.
+1. the shared dendrogram is cut at K;
+2. each final cluster receives a colour according to the span of its oversampled BGM components along the optimal dendrogram leaf ordering;
+3. finer K values inherit related colours from the same broader dendrogram branches.
 
-When rare marker groups are provided, points2regions returns one score per group:
+This gives colour consistency across resolutions: a broad branch at low K is split into related colour shades at higher K.
 
-```text
-X_rare: n_bins x n_rare_groups
-```
-
-These rare-group scores do not drive the initial BGM fit. The BGM is still fitted on the SVD/PCA embedding stored in `X_norm`.
-
-Rare marker groups can influence only the hierarchical merge from oversampled `K_bgm` components to the final target `K`, controlled by:
+The user can choose another Matplotlib continuous colormap in the config. For example, colourblind-friendly alternatives can be tested with:
 
 ```json
-"beta_rare": 0.0
+"color": {
+  "colormap": "viridis",
+  "colormap_start": 0.0,
+  "colormap_end": 1.0
+}
 ```
 
-Use:
+or:
 
 ```json
-"beta_rare": 0.0
+"color": {
+  "colormap": "cividis",
+  "colormap_start": 0.0,
+  "colormap_end": 1.0
+}
 ```
 
-to ignore rare markers during merging.
-
-Use a positive value, for example:
-
-```json
-"beta_rare": 0.5
-```
-
-to add rare-marker-group distances to the merge distance.
-
-The merge distance is:
-
-```text
-d_comb = d_all + beta_rare * d_rare
-```
-
-where:
-
-- `d_all` is the distance between BGM component centroids in the SVD/PCA embedding.
-- `d_rare` is computed pairwise between oversampled BGM components: for each pair of components, SFUMATO computes the distance for every rare marker group and keeps the largest one.
-
-The max across groups is used so that a strong difference in any one rare marker group is not diluted by unrelated groups.
-
-## Rare Marker Outputs
-
-When rare marker groups are available, BGM writes diagnostic outputs per run:
-
-```text
-*_rare_group_soft_means.csv
-*_rare_group_soft_means_row_zscore.csv
-images/*_rare_group_soft_means_heatmap.png
-images/*_rare_group_soft_means_row_zscore_heatmap.png
-```
-
-Rows are rare marker groups and columns are final SFUMATO clusters.
-
-The raw heatmap shows the soft mean rare-group score per cluster.
-The row-z-scored heatmap shows relative enrichment of each rare marker group across clusters.
-
-These heatmaps are diagnostics. They help interpret whether rare marker groups are actually represented in the final clusters.
+Note that different colormaps have different perceptual properties. The default `gist_ncar` setting prioritises visual separability across many clusters.
 
 ## Local / Workstation
 
@@ -208,7 +255,7 @@ python preprocess.py --config configs/mousexeniumniche.json
 python run_bgm_gpu.py --config configs/mousexeniumniche.json
 ```
 
-To overwrite existing preprocessing caches:
+To overwrite an existing preprocessing cache:
 
 ```bash
 python preprocess.py --config configs/mousexeniumniche.json --force
@@ -244,39 +291,41 @@ For CPU-only preprocessing on Alvis, memory is allocated proportionally to reque
 
 ## Outputs
 
-Example preprocessing cache when SVD is enabled:
+Example preprocessing cache:
 
 ```text
-preprocess_cache_mousexeniumniche_svd/
+preprocess_cache_mousexeniumniche/
   mousexeniumniche_BIN40_F8_SVD10.npz
   mousexeniumniche_BIN40_F8_SVD10_preprocess_config.json
 ```
 
-Example preprocessing cache when PCA is enabled:
+Shared BGM outputs:
 
 ```text
-preprocess_cache_mousexeniumniche_pca/
-  mousexeniumniche_BIN40_F8_PCA10.npz
-  mousexeniumniche_BIN40_F8_PCA10_preprocess_config.json
+results_mousexeniumniche/
+  shared_BGM/
+    SVD10/
+      mousexeniumniche_BGM45toMAX30_BIN40_F8_SVD10_cluster_color_table_allK.csv
+      mousexeniumniche_BGM45toMAX30_BIN40_F8_SVD10_oversampled_merge_distances.csv
+      mousexeniumniche_BGM45toMAX30_BIN40_F8_SVD10_shared_bgm_config.json
+      weights_mousexeniumniche_BGM45toMAX30_BIN40_F8_SVD10.txt
+      images/
+        mousexeniumniche_BGM45toMAX30_BIN40_F8_SVD10_multiresolution_dendrogram_allK.png
 ```
 
-BGM outputs are grouped by `K` and dimensionality-reduction method:
+K-specific outputs:
 
 ```text
-results_mousexeniumniche_svd/
+results_mousexeniumniche/
   K30/
     SVD10/
       *_FULL.h5ad
       *_binlevel_FULL.csv
-      hues_*.csv
+      colors_*.csv
       weights_*.txt
-      *_oversampled_merge_distances.csv
       *_bgm_config.json
       images/
-        *_oversampled_dendrogram_cut.png
-        *_final_dendrogram_colors.png
-        *_rare_group_soft_means_heatmap.png
-        *_rare_group_soft_means_row_zscore_heatmap.png
+        *_cut_dendrogram.png
 ```
 
 The transcript-level probability CSV is skipped by default. Enable it with:
@@ -284,6 +333,38 @@ The transcript-level probability CSV is skipped by default. Enable it with:
 ```json
 "save_transcript_proba": true
 ```
+
+## Dendrogram Figures
+
+SFUMATO saves two types of dendrogram figures.
+
+The shared multiresolution dendrogram:
+
+```text
+*_multiresolution_dendrogram_allK.png
+```
+
+This figure shows:
+
+- the shared oversampled-component dendrogram;
+- branches coloured across resolutions;
+- one dashed horizontal cut line per K;
+- aligned colour strips showing cluster colours at each K.
+
+The K-specific dendrogram:
+
+```text
+*_cut_dendrogram.png
+```
+
+This figure shows:
+
+- the same shared dendrogram;
+- branches coloured according to the selected K;
+- one dashed cut line;
+- one colour strip for that K.
+
+These figures are useful for checking that colour assignment is consistent across resolutions.
 
 ## Optional UMAP Figures
 
@@ -307,22 +388,12 @@ Plot the first embedding dimensions directly:
 python plot_embedding_dims.py --config configs/mousexeniumniche.json --k 30
 ```
 
-This is useful for checking whether the low-dimensional representation already contains clear structure before UMAP.
-
-## Hue Equalization Figure
-
-Hue equalization figure from a `hues_*.csv` file:
-
-```bash
-python plot_hue_equalization.py \
-  --hues-csv results_mousexeniumniche_svd/K30/SVD10/hues_mousexeniumniche_BGM45to30_BIN40_F8_SVD10.csv \
-  --output results_mousexeniumniche_svd/K30/SVD10/images/mousexeniumniche_K30_SVD10_hue_equalization.png
-```
+This is useful for checking whether the SVD representation already contains clear structure before UMAP.
 
 ## Notes
 
-- `X_norm` is the embedding used by BGM.
-- `X_rare` is optional and contains rare marker-group scores.
-- Without rare marker groups, the pipeline follows the ordinary SFUMATO path.
-- Rare marker groups can preserve rare-marker-enriched oversampled BGM components during hierarchical merging, but they cannot recover a rare component that was never separated by the initial BGM fit.
-- SFUMATO colours are assigned from PCA of final cluster centroids in embedding space; rare marker groups affect colours only indirectly if they change the final merge.
+- `X_norm` is the sparse-SVD embedding used by BGM.
+- BGM is fitted once using `K_bgm = ceil(bgm_oversample * max(k_list))`.
+- All requested K values are obtained by cutting the same shared dendrogram.
+- Cluster colours are assigned from the shared dendrogram ordering, not from a separate PCA of final centroids.
+- Colour differences should be interpreted as following the shared hierarchical ordering, not as exact metric distances in expression space.

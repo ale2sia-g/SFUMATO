@@ -9,7 +9,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import scipy.sparse as sp
 from skimage.color import lab2rgb
 from sklearn.manifold import TSNE
 from sklearn.metrics import pairwise_distances
@@ -37,23 +36,15 @@ class PreprocessConfig:
     bin_width: int
     factor: int
     seed: int
-    use_svd: bool
-    use_pca: bool
     comp: int
     save_p2r: bool
     cache_dir: Path
     alpha: float = 1.0
-    rare_genes: Any | None = None
 
     @classmethod
     def from_dict(cls, config: dict[str, Any]) -> "PreprocessConfig":
         columns = config.get("columns", {})
         preprocess = config.get("preprocess", {})
-
-        use_svd = bool(preprocess.get("use_svd", True))
-        use_pca = bool(preprocess.get("use_pca", False))
-        if not use_svd and not use_pca:
-            raise ValueError("At least one of preprocess.use_svd or preprocess.use_pca must be true.")
 
         return cls(
             run_name=config["run_name"],
@@ -68,17 +59,17 @@ class PreprocessConfig:
             bin_width=int(preprocess["bin_width"]),
             factor=int(preprocess["factor"]),
             seed=int(preprocess.get("seed", 8)),
-            use_svd=use_svd,
-            use_pca=use_pca,
             comp=int(preprocess["comp"]),
             save_p2r=bool(preprocess.get("save_p2r", True)),
             cache_dir=resolve_path(config, preprocess["cache_dir"]),
             alpha=float(preprocess.get("alpha", 1.0)),
-            rare_genes=preprocess.get("rare_genes"),
         )
 
 
-def validate_and_standardize_dataframe(df: pd.DataFrame, cfg: PreprocessConfig) -> pd.DataFrame:
+def validate_and_standardize_dataframe(
+    df: pd.DataFrame,
+    cfg: PreprocessConfig,
+) -> pd.DataFrame:
     missing = [c for c in [cfg.x_col, cfg.y_col, cfg.gene_col] if c not in df.columns]
     if missing:
         raise ValueError(f"Input CSV is missing required columns: {missing}")
@@ -98,69 +89,6 @@ def validate_and_standardize_dataframe(df: pd.DataFrame, cfg: PreprocessConfig) 
 
     out[STANDARD_NUM_ID] = out[STANDARD_NUM_ID].astype("category")
     return out
-
-
-def resolve_rare_genes(df: pd.DataFrame, rare_genes: Any | None) -> dict[str, list[str]]:
-    """
-    Normalize rare marker configuration.
-
-    Accepted config values
-    ----------------------
-    null / None / {}:
-        No rare marker groups. Returns {}.
-
-    dict:
-        {
-            "group_A": ["gene1"],
-            "group_B": ["gene2", "gene3"]
-        }
-
-    list/tuple/set:
-        Backward-compatible convenience. Converted to:
-        {
-            "rare": [...]
-        }
-
-    No automatic fallback gene is selected. This keeps runs without rare genes
-    identical to ordinary SFUMATO runs.
-    """
-    if rare_genes is None:
-        return {}
-
-    if isinstance(rare_genes, dict):
-        out: dict[str, list[str]] = {}
-        for group_name, genes in rare_genes.items():
-            group_name = str(group_name)
-
-            if genes is None:
-                gene_list: list[str] = []
-            elif isinstance(genes, str):
-                gene_list = [genes]
-            else:
-                gene_list = [str(g) for g in genes]
-
-            gene_list = sorted(set(gene_list))
-            if gene_list:
-                out[group_name] = gene_list
-
-        return out
-
-    if isinstance(rare_genes, (list, tuple, set)):
-        gene_list = sorted(set(str(g) for g in rare_genes))
-        if not gene_list:
-            return {}
-        return {"rare": gene_list}
-
-    raise TypeError(
-        "preprocess.rare_genes must be null, a dictionary of marker groups, "
-        "or a list of genes."
-    )
-
-
-def to_dense_float32(X: Any) -> np.ndarray:
-    if sp.issparse(X):
-        return X.astype(np.float32).toarray()
-    return np.asarray(X, dtype=np.float32)
 
 
 def rgb01_to_hex(rgb01: np.ndarray) -> str:
@@ -194,65 +122,13 @@ def tsne_colors_p2r(cluster_centers: np.ndarray, seed: int = 42) -> list[str]:
     return [rgb01_to_hex(c) for c in colors_rgb]
 
 
-def reduction_methods_from_config(cfg: PreprocessConfig) -> list[str]:
-    methods: list[str] = []
-    if cfg.use_svd:
-        methods.append("svd")
-    if cfg.use_pca:
-        methods.append("pca")
-    if not methods:
-        raise ValueError("At least one reduction method must be enabled.")
-    return methods
-
-
-def method_label(method: str) -> str:
-    method = method.lower()
-    if method == "svd":
-        return "SVD"
-    if method == "pca":
-        return "PCA"
-    raise ValueError(f"Unknown reduction method: {method}")
-
-
-def method_uses_svd(method: str) -> bool:
-    method = method.lower()
-    if method == "svd":
-        return True
-    if method == "pca":
-        return False
-    raise ValueError(f"Unknown reduction method: {method}")
-
-
-def method_cache_dir(base_cache_dir: Path, method: str) -> Path:
-    """
-    Return a method-specific cache directory.
-
-    If base_cache_dir already ends with _svd or _pca, replace that suffix.
-    Otherwise append _svd or _pca.
-    """
-    method = method.lower()
-    if method not in {"svd", "pca"}:
-        raise ValueError(f"Unknown reduction method: {method}")
-
-    name = base_cache_dir.name
-    lower_name = name.lower()
-
-    if lower_name.endswith("_svd") or lower_name.endswith("_pca"):
-        prefix = name[:-4]
-        return base_cache_dir.parent / f"{prefix}_{method}"
-
-    return base_cache_dir.parent / f"{name}_{method}"
-
-
 def make_preprocess_stem(
     run_name: str,
     bin_width: int,
     factor: int,
     comp: int,
-    use_svd: bool,
 ) -> str:
-    dim_tag = f"_SVD{comp}" if use_svd else f"_PCA{comp}"
-    return f"{run_name}_BIN{bin_width}_F{factor}{dim_tag}"
+    return f"{run_name}_BIN{bin_width}_F{factor}_SVD{comp}"
 
 
 def make_bgm_stem(
@@ -262,13 +138,22 @@ def make_bgm_stem(
     bin_width: int,
     factor: int,
     comp: int,
-    use_svd: bool,
     bgm_oversample: float,
 ) -> str:
-    dim_tag = f"_SVD{comp}" if use_svd else f"_PCA{comp}"
     if bgm_oversample > 1.0:
-        return f"{run_name}_BGM{k_bgm}to{k}_BIN{bin_width}_F{factor}{dim_tag}"
-    return f"{run_name}_BGM{k_bgm}_BIN{bin_width}_F{factor}{dim_tag}"
+        return f"{run_name}_BGM{k_bgm}to{k}_BIN{bin_width}_F{factor}_SVD{comp}"
+    return f"{run_name}_BGM{k_bgm}_BIN{bin_width}_F{factor}_SVD{comp}"
+
+
+def make_shared_bgm_stem(
+    run_name: str,
+    k_bgm: int,
+    k_max: int,
+    bin_width: int,
+    factor: int,
+    comp: int,
+) -> str:
+    return f"{run_name}_BGM{k_bgm}toMAX{k_max}_BIN{bin_width}_F{factor}_SVD{comp}"
 
 
 def p2r_cache_keys(k: int) -> tuple[str, str]:

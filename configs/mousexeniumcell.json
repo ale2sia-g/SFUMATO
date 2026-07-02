@@ -1,6 +1,6 @@
 {
   "run_name": "mousexeniumcell",
-  "input_csv": "xenium_mouse.csv",
+  "input_csv": "transcripts_files/xenium_mouse.csv",
   "columns": {
     "x": "x",
     "y": "y",
@@ -14,22 +14,23 @@
     "bin_width": 5,
     "factor": 4,
     "seed": 8,
-    "use_svd": true,
-    "use_pca": false,
     "comp": 10,
     "save_p2r": true,
     "alpha": 1.0,
-    "rare_genes": null,
     "cache_dir": "preprocess_cache_mousexeniumcell"
   },
   "bgm": {
     "outroot": "results_mousexeniumcell",
     "save_transcript_proba": false,
-    "beta_rare": 0.0,
     "merge_method": "complete",
     "merge_metric": "cosine",
-    "bgm_weight_prior": 1,
-    "use_hist_equalization": true
+    "bgm_weight_prior": 1
+  },
+  "color": {
+    "colormap": "gist_ncar",
+    "colormap_start": 0.08,
+    "colormap_end": 0.92,
+    "dendrogram_branch_linewidth": 3.0
   },
   "umap": {
     "run": false,
@@ -40,3 +41,4 @@
     "point_size": 0.35
   }
 }
+

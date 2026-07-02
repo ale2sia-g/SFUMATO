@@ -5,13 +5,13 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import matplotlib.colors as mcolors
 import numpy as np
 import pandas as pd
 
-from scipy.cluster.hierarchy import dendrogram, linkage
+from scipy.cluster.hierarchy import dendrogram, fcluster
 from scipy.spatial.distance import pdist
 from sklearn.preprocessing import normalize as sk_normalize
 
@@ -19,9 +19,7 @@ from utils_config import default_results_dir, resolve_path
 from utils_preprocess import (
     make_bgm_stem,
     make_preprocess_stem,
-    method_cache_dir,
-    method_label,
-    method_uses_svd,
+    make_shared_bgm_stem,
     p2r_cache_keys,
 )
 
@@ -34,28 +32,25 @@ class BGMConfig:
     bin_width: int
     factor: int
     seed: int
-    use_svd: bool
-    use_pca: bool
     comp: int
     save_p2r: bool
     cache_dir: Path
     outroot: Path
     save_transcript_proba: bool = False
-    beta_rare: float = 0.0
     merge_method: str = "complete"
     merge_metric: str = "cosine"
     bgm_weight_prior: float = 1.0
-    use_hist_equalization: bool = True
+
+    color_colormap: str = "gist_ncar"
+    color_colormap_start: float = 0.08
+    color_colormap_end: float = 0.92
+    dendrogram_branch_linewidth: float = 3.0
 
     @classmethod
     def from_dict(cls, config: dict[str, Any]) -> "BGMConfig":
         preprocess = config.get("preprocess", {})
         bgm = config.get("bgm", {})
-
-        use_svd = bool(preprocess.get("use_svd", True))
-        use_pca = bool(preprocess.get("use_pca", False))
-        if not use_svd and not use_pca:
-            raise ValueError("At least one of preprocess.use_svd or preprocess.use_pca must be true.")
+        color = config.get("color", {})
 
         cache_dir = resolve_path(config, preprocess["cache_dir"])
         outroot_value = bgm.get("outroot")
@@ -72,74 +67,50 @@ class BGMConfig:
             bin_width=int(preprocess["bin_width"]),
             factor=int(preprocess["factor"]),
             seed=int(preprocess.get("seed", 8)),
-            use_svd=use_svd,
-            use_pca=use_pca,
             comp=int(preprocess["comp"]),
             save_p2r=bool(preprocess.get("save_p2r", True)),
             cache_dir=cache_dir,
             outroot=outroot,
             save_transcript_proba=bool(bgm.get("save_transcript_proba", False)),
-            beta_rare=float(bgm.get("beta_rare", 0.0)),
             merge_method=str(bgm.get("merge_method", "complete")),
             merge_metric=str(bgm.get("merge_metric", "cosine")),
             bgm_weight_prior=float(bgm.get("bgm_weight_prior", 1.0)),
-            use_hist_equalization=bool(bgm.get("use_hist_equalization", True)),
+            color_colormap=str(color.get("colormap", "gist_ncar")),
+            color_colormap_start=float(color.get("colormap_start", 0.08)),
+            color_colormap_end=float(color.get("colormap_end", 0.92)),
+            dendrogram_branch_linewidth=float(
+                color.get("dendrogram_branch_linewidth", 3.0)
+            ),
         )
 
 
-def bgm_methods_from_config(cfg: BGMConfig) -> list[str]:
-    methods: list[str] = []
-    if cfg.use_svd:
-        methods.append("svd")
-    if cfg.use_pca:
-        methods.append("pca")
-    if not methods:
-        raise ValueError("At least one BGM reduction method must be enabled.")
-    return methods
+def result_dir_for(cfg: BGMConfig, k: int) -> Path:
+    return cfg.outroot / f"K{k}" / f"SVD{cfg.comp}"
 
 
-def method_outroot(base_outroot: Path, method: str) -> Path:
-    """
-    Return a method-specific result directory.
-
-    If base_outroot already ends with _svd or _pca, replace that suffix.
-    Otherwise append _svd or _pca.
-    """
-    method = method.lower()
-    if method not in {"svd", "pca"}:
-        raise ValueError(f"Unknown reduction method: {method}")
-
-    name = base_outroot.name
-    lower_name = name.lower()
-
-    if lower_name.endswith("_svd") or lower_name.endswith("_pca"):
-        prefix = name[:-4]
-        return base_outroot.parent / f"{prefix}_{method}"
-
-    return base_outroot.parent / f"{name}_{method}"
+def image_dir_for(cfg: BGMConfig, k: int) -> Path:
+    return result_dir_for(cfg, k) / "images"
 
 
-def result_dir_for(cfg: BGMConfig, k: int, method: str) -> Path:
-    return method_outroot(cfg.outroot, method) / f"K{k}" / f"{method_label(method)}{cfg.comp}"
+def shared_result_dir_for(cfg: BGMConfig) -> Path:
+    return cfg.outroot / f"shared_BGM" / f"SVD{cfg.comp}"
 
 
-def image_dir_for(cfg: BGMConfig, k: int, method: str) -> Path:
-    return result_dir_for(cfg, k, method) / "images"
+def shared_image_dir_for(cfg: BGMConfig) -> Path:
+    return shared_result_dir_for(cfg) / "images"
 
 
-def cache_file_for(cfg: BGMConfig, method: str) -> Path:
+def cache_file_for(cfg: BGMConfig) -> Path:
     stem = make_preprocess_stem(
         cfg.run_name,
         cfg.bin_width,
         cfg.factor,
         cfg.comp,
-        method_uses_svd(method),
     )
-    return method_cache_dir(cfg.cache_dir, method) / f"{stem}.npz"
+    return cfg.cache_dir / f"{stem}.npz"
 
 
-def bgm_stem_for(cfg: BGMConfig, k: int, method: str) -> str:
-    k_bgm = int(np.ceil(cfg.bgm_oversample * k))
+def bgm_stem_for(cfg: BGMConfig, k: int, k_bgm: int) -> str:
     return make_bgm_stem(
         cfg.run_name,
         k_bgm,
@@ -147,8 +118,18 @@ def bgm_stem_for(cfg: BGMConfig, k: int, method: str) -> str:
         cfg.bin_width,
         cfg.factor,
         cfg.comp,
-        method_uses_svd(method),
         cfg.bgm_oversample,
+    )
+
+
+def shared_bgm_stem_for(cfg: BGMConfig, k_bgm: int, k_max: int) -> str:
+    return make_shared_bgm_stem(
+        cfg.run_name,
+        k_bgm,
+        k_max,
+        cfg.bin_width,
+        cfg.factor,
+        cfg.comp,
     )
 
 
@@ -156,79 +137,6 @@ def rgb01_to_hex(rgb01: np.ndarray) -> str:
     rgb = np.clip(np.asarray(rgb01), 0.0, 1.0)
     rgb255 = (rgb * 255).astype(int)
     return "#{:02x}{:02x}{:02x}".format(rgb255[0], rgb255[1], rgb255[2])
-
-
-def hsv_to_rgb(hsv: np.ndarray) -> np.ndarray:
-    rgb = np.zeros_like(hsv)
-    for i in range(hsv.shape[0]):
-        rgb[i] = mcolors.hsv_to_rgb(hsv[i])
-    return rgb
-
-
-def circular_hist_equalization(
-    hue: np.ndarray,
-    beta: float = 0.5,
-    eps: float = 1e-8,
-    return_steps: bool = False,
-) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
-    hue = np.asarray(hue, dtype=float)
-    n = len(hue)
-    if n <= 1:
-        return (hue.copy(), hue.copy()) if return_steps else hue.copy()
-
-    sort_idx = np.argsort(hue)
-    h_sorted = hue[sort_idx]
-    gaps = np.diff(np.concatenate([h_sorted, h_sorted[:1] + 1.0]))
-    k_star = int(np.argmax(gaps))
-    h_cut = (h_sorted[k_star] + 0.5 * gaps[k_star]) % 1.0
-
-    h_shifted = (hue - h_cut) % 1.0
-    sort_shift = np.argsort(h_shifted)
-    h_shift_sorted = h_shifted[sort_shift]
-    gaps_shift = np.diff(np.concatenate([h_shift_sorted, h_shift_sorted[:1] + 1.0]))
-    weights = (gaps_shift + eps) ** beta
-
-    cdf = np.zeros(n)
-    for i in range(1, n):
-        cdf[i] = cdf[i - 1] + weights[i - 1]
-    cdf = cdf / (cdf[-1] + weights[-1] + eps)
-
-    h_new = np.zeros_like(hue)
-    h_new[sort_shift] = cdf
-    return (h_new, h_shifted) if return_steps else h_new
-
-
-def centroids_to_hsv_rgb(
-    centroids_3d: np.ndarray,
-    use_hist_equalization: bool,
-    eps: float = 1e-8,
-    return_hues: bool = False,
-) -> np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    x, y, z = centroids_3d.T
-    hue_raw = np.arctan2(y, x)
-    hue_raw = (hue_raw + np.pi) / (2 * np.pi)
-
-    if use_hist_equalization:
-        hue_equalized, hue_rotated = circular_hist_equalization(
-            hue_raw, beta=0.5, eps=eps, return_steps=True
-        )
-        hue_final = hue_equalized
-    else:
-        hue_rotated = hue_raw.copy()
-        hue_equalized = hue_raw.copy()
-        hue_final = hue_raw
-
-    sat = (z - z.min()) / (z.max() - z.min() + eps)
-    sat = sat**0.5
-    sat = 0.6 + 0.4 * sat
-    val = 0.9 * np.ones_like(hue_raw)
-
-    hsv = np.stack([hue_final, sat, val], axis=1)
-    rgb = hsv_to_rgb(hsv)
-
-    if return_hues:
-        return rgb, hue_raw, hue_rotated, hue_equalized
-    return rgb
 
 
 def color_mix_top2_log(
@@ -269,200 +177,13 @@ def safe_cosine_pdist(X: np.ndarray, eps: float = 1e-10) -> np.ndarray:
     return pdist(X_normed, metric="euclidean")
 
 
-def has_rare_groups(X_rare: np.ndarray, rare_group_names: np.ndarray | None = None) -> bool:
-    if X_rare is None:
-        return False
-    if X_rare.ndim != 2:
-        return False
-    if X_rare.shape[1] == 0:
-        return False
-    if rare_group_names is not None and len(rare_group_names) == 0:
-        return False
-    return True
-
-
-def rare_group_distance_max(
-    rare_centroids: np.ndarray,
-) -> np.ndarray | None:
-    """
-    Compute one condensed distance vector from rare-group centroids.
-
-    rare_centroids has shape:
-        n_clusters x n_rare_groups
-
-    For each rare group, distances are computed between cluster-level
-    soft means using euclidean distance on that single rare-group score.
-
-    The final rare distance is the elementwise maximum across rare groups.
-    This preserves a strong difference in any marker group instead of diluting
-    it by averaging across unrelated groups.
-    """
-    rare_centroids = np.asarray(rare_centroids, dtype=float)
-
-    if rare_centroids.ndim != 2 or rare_centroids.shape[1] == 0:
-        return None
-
-    distances = []
-    for group_idx in range(rare_centroids.shape[1]):
-        values = rare_centroids[:, group_idx : group_idx + 1]
-        distances.append(normalize_condensed(pdist(values, metric="euclidean")))
-
-    if not distances:
-        return None
-
-    return np.maximum.reduce(distances)
-
-
-def combined_merge_distance(
-    centroids_all: np.ndarray,
-    centroids_rare: np.ndarray | None,
-    beta_rare: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
-    """
-    Build the distance used for hierarchical merging.
-
-    d_all is always computed from the embedding centroids.
-
-    If beta_rare > 0 and rare-group centroids are available, d_rare is computed
-    as the maximum rare-group distance across marker groups, then added to d_all.
-
-    If rare groups are absent, this function returns the original d_all path.
-    """
-    d_all = normalize_condensed(safe_cosine_pdist(centroids_all))
-
-    if beta_rare <= 0 or centroids_rare is None:
-        return d_all, d_all, None
-
-    d_rare = rare_group_distance_max(centroids_rare)
-    if d_rare is None:
-        return d_all, d_all, None
-
-    d_comb = d_all + beta_rare * d_rare
-    return d_comb, d_all, d_rare
-
-
-def rare_group_soft_means(
-    X_rare: np.ndarray,
-    proba: np.ndarray,
-    rare_group_names: np.ndarray,
-) -> pd.DataFrame | None:
-    """
-    Return soft mean rare-group scores per final cluster.
-
-    Output dataframe:
-        rows    = rare groups
-        columns = cluster ids
-    """
-    if not has_rare_groups(X_rare, rare_group_names):
-        return None
-
-    rare_centroids, _ = soft_cluster_centroids(X_rare, proba)
-    cluster_labels = [f"C{i}" for i in range(rare_centroids.shape[0])]
-    group_labels = [str(x) for x in rare_group_names]
-
-    return pd.DataFrame(
-        rare_centroids.T,
-        index=group_labels,
-        columns=cluster_labels,
-    )
-
-
-def row_zscore(df: pd.DataFrame, eps: float = 1e-8) -> pd.DataFrame:
-    values = df.to_numpy(dtype=float)
-    mean = values.mean(axis=1, keepdims=True)
-    std = values.std(axis=1, keepdims=True)
-    z = (values - mean) / (std + eps)
-    return pd.DataFrame(z, index=df.index, columns=df.columns)
-
-
-def plot_rare_group_heatmaps(
-    rare_scores: pd.DataFrame | None,
-    outdir: Path,
-    stem: str,
-) -> None:
-    """
-    Save rare-group soft-mean CSVs and heatmaps.
-
-    The raw heatmap shows absolute soft mean marker-group scores.
-    The z-scored heatmap shows which clusters are relatively enriched for each
-    rare group.
-    """
-    if rare_scores is None or rare_scores.empty:
-        return
-
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    raw_csv = outdir / f"{stem}_rare_group_soft_means.csv"
-    z_csv = outdir / f"{stem}_rare_group_soft_means_row_zscore.csv"
-    raw_png = outdir / f"{stem}_rare_group_soft_means_heatmap.png"
-    z_png = outdir / f"{stem}_rare_group_soft_means_row_zscore_heatmap.png"
-
-    rare_scores.to_csv(raw_csv)
-    rare_scores_z = row_zscore(rare_scores)
-    rare_scores_z.to_csv(z_csv)
-
-    col_cluster = rare_scores.shape[1] > 1
-    row_cluster = rare_scores.shape[0] > 1
-
-    sns.set_theme(style="white", font_scale=0.8)
-
-    g = sns.clustermap(
-        rare_scores,
-        cmap="mako",
-        row_cluster=row_cluster,
-        col_cluster=col_cluster,
-        linewidths=0.2,
-        figsize=(max(6, rare_scores.shape[1] * 0.45), max(4, rare_scores.shape[0] * 0.35)),
-        cbar_kws={"label": "soft mean score"},
-    )
-    g.fig.suptitle("Rare marker-group soft means", y=1.02)
-    g.savefig(raw_png, dpi=220, bbox_inches="tight")
-    plt.close(g.fig)
-
-    g = sns.clustermap(
-        rare_scores_z,
-        cmap="vlag",
-        center=0,
-        row_cluster=row_cluster,
-        col_cluster=col_cluster,
-        linewidths=0.2,
-        figsize=(max(6, rare_scores.shape[1] * 0.45), max(4, rare_scores.shape[0] * 0.35)),
-        cbar_kws={"label": "row z-score"},
-    )
-    g.fig.suptitle("Rare marker-group relative enrichment", y=1.02)
-    g.savefig(z_png, dpi=220, bbox_inches="tight")
-    plt.close(g.fig)
-
-
-def load_rare_group_names(data: Any) -> np.ndarray:
-    if "rare_group_names" not in data:
-        return np.array([], dtype=object)
-    return np.asarray(data["rare_group_names"], dtype=object)
-
-
-def load_json_cache_field(data: Any, key: str) -> dict:
-    if key not in data:
-        return {}
-    value = data[key]
-    if len(value) == 0:
-        return {}
-    item = value[0]
-    if isinstance(item, bytes):
-        item = item.decode("utf-8")
-    return json.loads(str(item))
-
-
 def top2_from_proba(P: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     cluster = P.argmax(axis=1)
     p1 = P.max(axis=1)
+
     if P.shape[1] == 1:
         return cluster, np.zeros_like(cluster), p1, np.zeros_like(p1)
+
     order = np.argsort(P, axis=1)
     second_cluster = order[:, -2]
     p2 = np.take_along_axis(P, second_cluster[:, None], axis=1).ravel()
@@ -475,15 +196,19 @@ def merge_probabilities_from_labels(
 ) -> tuple[np.ndarray, list[np.ndarray]]:
     merge_labels = np.asarray(merge_labels)
     uniq = np.unique(merge_labels)
+
     out = np.zeros((proba.shape[0], len(uniq)), dtype=float)
     groups = []
+
     for j, lab in enumerate(uniq):
         idx = np.where(merge_labels == lab)[0]
         out[:, j] = proba[:, idx].sum(axis=1)
         groups.append(idx)
+
     row_sums = out.sum(axis=1, keepdims=True)
     row_sums[row_sums == 0] = 1.0
     out = out / row_sums
+
     return out, groups
 
 
@@ -495,10 +220,12 @@ def merge_centroids_by_groups(
 ) -> tuple[np.ndarray, np.ndarray]:
     out = np.zeros((len(groups), centroids.shape[1]), dtype=float)
     out_masses = np.zeros(len(groups), dtype=float)
+
     for j, idx in enumerate(groups):
         w = masses[idx]
         out[j] = (centroids[idx] * w[:, None]).sum(axis=0) / (w.sum() + eps)
         out_masses[j] = w.sum()
+
     return out, out_masses
 
 
@@ -506,20 +233,27 @@ def csv_to_h5ad(df: pd.DataFrame):
     import anndata as ad
 
     adata_o = ad.AnnData(obs=df)
+
     for col in ["color_hard_hsv", "color_log_hsv", "color_p2r"]:
         if col in adata_o.obs.columns:
-            adata_o.obs[col] = adata_o.obs[col].replace("NaN", "#000000").fillna("#000000")
+            adata_o.obs[col] = (
+                adata_o.obs[col].replace("NaN", "#000000").fillna("#000000")
+            )
+
     for col in ["x", "y"]:
         if col in adata_o.obs.columns and adata_o.obs[col].dtype == np.float64:
             adata_o.obs[col] = adata_o.obs[col].round().astype(int)
+
     for col in adata_o.obs.columns:
         if adata_o.obs[col].dtype == np.float64:
             adata_o.obs[col] = adata_o.obs[col].astype(np.float32)
+
     cols = ["PC1", "PC2", "PC3"]
     existing = [c for c in cols if c in adata_o.obs.columns]
     if existing:
         adata_o.obsm["X_pca"] = adata_o.obs[existing].to_numpy(dtype=np.float32)
         adata_o.obs.drop(columns=existing, inplace=True)
+
     return adata_o
 
 
@@ -535,25 +269,185 @@ def get_p2r_from_cache(data: Any, k: int) -> tuple[np.ndarray, np.ndarray]:
             f"P2R output for K={k} was requested but not found in cache. "
             f"Available P2R K values: {available}"
         )
+
     return data[cluster_key], data[color_key]
 
 
-def _cut_height_for_k(Z: np.ndarray, k: int) -> float | None:
+# ==========================
+# HIERARCHICAL COLORS
+# ==========================
+
+def get_continuous_colormap_func(
+    cmap_name: str = "gist_ncar",
+    start: float = 0.08,
+    end: float = 0.92,
+) -> Callable[[float], np.ndarray]:
+    import matplotlib as mpl
+
+    cmap = mpl.colormaps[cmap_name]
+    start = float(start)
+    end = float(end)
+
+    if not (0.0 <= start <= 1.0 and 0.0 <= end <= 1.0):
+        raise ValueError("Colormap start/end must be within [0, 1].")
+    if start >= end:
+        raise ValueError("Colormap start must be smaller than colormap end.")
+
+    def color_func(t: float) -> np.ndarray:
+        t = float(np.clip(t, 0.0, 1.0))
+        return np.asarray(cmap(start + t * (end - start))[:3], dtype=float)
+
+    return color_func
+
+
+def leaf_rank_from_linkage(Z: np.ndarray) -> dict[int, int]:
+    d = dendrogram(Z, no_plot=True)
+    leaf_order = d["leaves"]
+    return {int(leaf): int(rank) for rank, leaf in enumerate(leaf_order)}
+
+
+def node_members_from_linkage(Z: np.ndarray) -> dict[int, set[int]]:
+    n_leaves = Z.shape[0] + 1
+    node_members = {i: {i} for i in range(n_leaves)}
+
+    for row_idx, row in enumerate(Z):
+        left, right = int(row[0]), int(row[1])
+        node_id = n_leaves + row_idx
+        node_members[node_id] = node_members[left] | node_members[right]
+
+    return node_members
+
+
+def cluster_spans_for_cut(
+    Z: np.ndarray,
+    k: int,
+    leaf_rank: dict[int, int],
+) -> tuple[np.ndarray, dict[int, dict[str, Any]]]:
+    labels = fcluster(Z, t=k, criterion="maxclust")
+    spans: dict[int, dict[str, Any]] = {}
+
+    for cluster_id in np.unique(labels):
+        members = np.where(labels == cluster_id)[0]
+        ranks = np.array([leaf_rank[int(m)] for m in members])
+
+        spans[int(cluster_id)] = {
+            "members": members,
+            "rank_min": int(ranks.min()),
+            "rank_max": int(ranks.max()),
+            "rank_center": float((ranks.min() + ranks.max()) / 2),
+        }
+
+    return labels, spans
+
+
+def colors_for_cut(
+    Z: np.ndarray,
+    k: int,
+    leaf_rank: dict[int, int],
+    color_func: Callable[[float], np.ndarray],
+) -> tuple[np.ndarray, dict[int, dict[str, Any]], dict[int, str], dict[int, np.ndarray]]:
+    labels, spans = cluster_spans_for_cut(Z, k, leaf_rank)
+    n_leaves = Z.shape[0] + 1
+
+    colors_hex: dict[int, str] = {}
+    colors_rgb: dict[int, np.ndarray] = {}
+
+    for cluster_id, info in spans.items():
+        t = info["rank_center"] / max(n_leaves - 1, 1)
+        rgb = color_func(t)
+        colors_rgb[int(cluster_id)] = rgb
+        colors_hex[int(cluster_id)] = rgb01_to_hex(rgb)
+
+    return labels, spans, colors_hex, colors_rgb
+
+
+def cut_height_for_k(Z: np.ndarray, k: int) -> float | None:
     n_leaves = Z.shape[0] + 1
     if k >= n_leaves or k <= 1:
         return None
+
     lower_idx = n_leaves - k - 1
     upper_idx = n_leaves - k
+
     lower = Z[lower_idx, 2] if lower_idx >= 0 else 0.0
     upper = Z[upper_idx, 2] if upper_idx < Z.shape[0] else Z[-1, 2]
+
     return float((lower + upper) / 2.0)
 
 
-def plot_oversampled_dendrogram(
+def link_color_func_for_cut(
+    labels: np.ndarray,
+    cluster_colors: dict[int, str],
+    node_members: dict[int, set[int]],
+) -> Callable[[int], str]:
+    def func(node_id: int) -> str:
+        members = node_members[node_id]
+        cls = {int(labels[m]) for m in members}
+
+        if len(cls) == 1:
+            cluster_id = next(iter(cls))
+            return cluster_colors[cluster_id]
+
+        return "#bdbdbd"
+
+    return func
+
+
+def link_color_func_multiresolution(
     Z: np.ndarray,
-    target_k: int,
+    k_list: list[int],
+    leaf_rank: dict[int, int],
+    node_members: dict[int, set[int]],
+    color_func: Callable[[float], np.ndarray],
+) -> Callable[[int], str]:
+    """
+    Color branches using the finest available K first.
+
+    Low branches tend to receive colors from the finest cut. Intermediate
+    branches receive colors from coarser cuts when they are no longer pure at
+    the finest resolution. Branches above the coarsest cut remain grey.
+    """
+    k_sorted = sorted([int(k) for k in k_list], reverse=True)
+
+    labels_by_k = {}
+    colors_by_k = {}
+
+    for k in k_sorted:
+        labels, _, colors_hex, _ = colors_for_cut(Z, k, leaf_rank, color_func)
+        labels_by_k[k] = labels
+        colors_by_k[k] = colors_hex
+
+    def func(node_id: int) -> str:
+        members = node_members[node_id]
+
+        for k in k_sorted:
+            labels = labels_by_k[k]
+            cls = {int(labels[m]) for m in members}
+
+            if len(cls) == 1:
+                cluster_id = next(iter(cls))
+                return colors_by_k[k][cluster_id]
+
+        return "#bdbdbd"
+
+    return func
+
+
+def thicken_dendrogram_lines(ax, linewidth: float = 3.0) -> None:
+    for collection in ax.collections:
+        try:
+            collection.set_linewidth(linewidth)
+        except Exception:
+            pass
+
+
+def plot_multiresolution_dendrogram(
+    Z: np.ndarray,
+    k_list: list[int],
+    color_func: Callable[[float], np.ndarray],
     path: Path,
     title: str,
+    branch_linewidth: float = 3.0,
 ) -> None:
     import matplotlib
 
@@ -561,68 +455,225 @@ def plot_oversampled_dendrogram(
     import matplotlib.pyplot as plt
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(12, 5), dpi=220)
-    dendrogram(Z, ax=ax, no_labels=False, color_threshold=None)
-    cut_height = _cut_height_for_k(Z, target_k)
-    if cut_height is not None:
-        ax.axhline(cut_height, color="black", linewidth=1.2, linestyle="--")
-    ax.set_title(title, fontsize=10)
-    ax.set_xlabel("Oversampled BGM component")
-    ax.set_ylabel("Merge distance")
-    fig.tight_layout()
-    fig.savefig(path, bbox_inches="tight")
-    plt.close(fig)
 
+    leaf_rank = leaf_rank_from_linkage(Z)
+    node_members = node_members_from_linkage(Z)
 
-def plot_final_dendrogram_with_colors(
-    centroids: np.ndarray,
-    colors_rgb: list[np.ndarray],
-    path: Path,
-    title: str,
-    method: str = "complete",
-) -> None:
-    import matplotlib
+    fig_height = 7.5 + 0.38 * len(k_list)
+    fig, ax = plt.subplots(figsize=(15, fig_height), dpi=220)
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    d = dendrogram(
+        Z,
+        ax=ax,
+        labels=[str(i) for i in range(Z.shape[0] + 1)],
+        leaf_rotation=90,
+        leaf_font_size=6,
+        link_color_func=link_color_func_multiresolution(
+            Z,
+            k_list,
+            leaf_rank,
+            node_members,
+            color_func,
+        ),
+        above_threshold_color="#9e9e9e",
+    )
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if len(centroids) <= 1:
-        return
+    thicken_dendrogram_lines(ax, linewidth=branch_linewidth)
 
-    distances = normalize_condensed(safe_cosine_pdist(centroids))
-    Z = linkage(distances, method=method)
+    displayed_leaves = d["leaves"]
+    x_by_leaf = {leaf: 5 + 10 * i for i, leaf in enumerate(displayed_leaves)}
 
-    fig, ax = plt.subplots(figsize=(max(8, len(centroids) * 0.45), 5), dpi=220)
-    labels = [str(i) for i in range(len(centroids))]
-    dendro = dendrogram(Z, ax=ax, labels=labels, color_threshold=None)
-    ax.set_title(title, fontsize=10)
-    ax.set_xlabel("Final cluster")
-    ax.set_ylabel("Merge distance")
+    _, ymax = ax.get_ylim()
+    strip_h = 0.045 * ymax
+    gap = 0.016 * ymax
+    base_y = -strip_h - gap
 
-    leaf_labels = dendro["ivl"]
-    x_positions = ax.get_xticks()
-    y_min, y_max = ax.get_ylim()
-    swatch_y = y_min - 0.08 * (y_max - y_min)
-    ax.set_ylim(swatch_y - 0.03 * (y_max - y_min), y_max)
+    for k in k_list:
+        h = cut_height_for_k(Z, int(k))
+        if h is None:
+            continue
 
-    for x, lab in zip(x_positions, leaf_labels):
-        cluster_id = int(lab)
-        ax.scatter(
-            [x],
-            [swatch_y],
-            s=90,
-            marker="s",
-            c=[colors_rgb[cluster_id]],
-            edgecolors="black",
-            linewidths=0.3,
-            clip_on=False,
-            zorder=5,
+        ax.axhline(
+            h,
+            color="#333333",
+            linewidth=1.2,
+            linestyle="--",
+            alpha=0.75,
+        )
+        ax.text(
+            ax.get_xlim()[1] + 5,
+            h,
+            f"K={int(k)}",
+            va="center",
+            ha="left",
+            fontsize=8,
+            color="#333333",
         )
 
+    for row, k in enumerate(k_list):
+        labels, spans, colors_hex, _ = colors_for_cut(Z, int(k), leaf_rank, color_func)
+        y = base_y - row * (strip_h + gap)
+
+        ax.text(
+            -12,
+            y + strip_h / 2,
+            f"K={int(k)}",
+            va="center",
+            ha="right",
+            fontsize=9,
+        )
+
+        for cluster_id, info in spans.items():
+            members = info["members"]
+            xs = np.array([x_by_leaf[int(m)] for m in members])
+            x0 = xs.min() - 5
+            width = xs.max() - xs.min() + 10
+
+            ax.add_patch(
+                plt.Rectangle(
+                    (x0, y),
+                    width,
+                    strip_h,
+                    facecolor=colors_hex[int(cluster_id)],
+                    edgecolor="white",
+                    linewidth=0.5,
+                    clip_on=False,
+                )
+            )
+
+    ax.set_ylim(base_y - len(k_list) * (strip_h + gap) - gap, ymax)
+    ax.set_title(title, fontsize=13)
+    ax.set_ylabel("linkage distance")
+    ax.set_xlabel("oversampled BGM components")
+
     fig.tight_layout()
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_cut_dendrogram(
+    Z: np.ndarray,
+    k: int,
+    color_func: Callable[[float], np.ndarray],
+    path: Path,
+    title: str,
+    branch_linewidth: float = 3.0,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    leaf_rank = leaf_rank_from_linkage(Z)
+    node_members = node_members_from_linkage(Z)
+
+    labels, spans, colors_hex, _ = colors_for_cut(Z, int(k), leaf_rank, color_func)
+
+    fig, ax = plt.subplots(figsize=(15, 6.5), dpi=220)
+
+    d = dendrogram(
+        Z,
+        ax=ax,
+        labels=[str(i) for i in range(Z.shape[0] + 1)],
+        leaf_rotation=90,
+        leaf_font_size=6,
+        link_color_func=link_color_func_for_cut(labels, colors_hex, node_members),
+        above_threshold_color="#9e9e9e",
+    )
+
+    thicken_dendrogram_lines(ax, linewidth=branch_linewidth)
+
+    displayed_leaves = d["leaves"]
+    x_by_leaf = {leaf: 5 + 10 * i for i, leaf in enumerate(displayed_leaves)}
+
+    _, ymax = ax.get_ylim()
+    strip_h = 0.05 * ymax
+    y = -strip_h * 1.6
+
+    h = cut_height_for_k(Z, int(k))
+    if h is not None:
+        ax.axhline(
+            h,
+            color="#333333",
+            linewidth=1.2,
+            linestyle="--",
+            alpha=0.75,
+        )
+        ax.text(
+            ax.get_xlim()[1] + 5,
+            h,
+            f"K={int(k)}",
+            va="center",
+            ha="left",
+            fontsize=8,
+            color="#333333",
+        )
+
+    for cluster_id, info in spans.items():
+        members = info["members"]
+        xs = np.array([x_by_leaf[int(m)] for m in members])
+        x0 = xs.min() - 5
+        width = xs.max() - xs.min() + 10
+
+        ax.add_patch(
+            plt.Rectangle(
+                (x0, y),
+                width,
+                strip_h,
+                facecolor=colors_hex[int(cluster_id)],
+                edgecolor="white",
+                linewidth=0.5,
+                clip_on=False,
+            )
+        )
+
+        ax.text(
+            x0 + width / 2,
+            y - 0.02 * ymax,
+            f"C{int(cluster_id)}",
+            ha="center",
+            va="top",
+            fontsize=7,
+        )
+
+    ax.set_ylim(y - 0.12 * ymax, ymax)
+    ax.set_title(title, fontsize=13)
+    ax.set_ylabel("linkage distance")
+    ax.set_xlabel("oversampled BGM components")
+
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def cluster_color_table(
+    Z: np.ndarray,
+    k_list: list[int],
+    color_func: Callable[[float], np.ndarray],
+) -> pd.DataFrame:
+    leaf_rank = leaf_rank_from_linkage(Z)
+    rows = []
+
+    for k in k_list:
+        _, spans, colors_hex, _ = colors_for_cut(Z, int(k), leaf_rank, color_func)
+
+        for cluster_id, info in spans.items():
+            rows.append(
+                {
+                    "K": int(k),
+                    "cluster": int(cluster_id),
+                    "n_components": int(len(info["members"])),
+                    "rank_min": int(info["rank_min"]),
+                    "rank_max": int(info["rank_max"]),
+                    "rank_center": float(info["rank_center"]),
+                    "color_hex": colors_hex[int(cluster_id)],
+                    "components": ",".join(str(int(x)) for x in info["members"]),
+                }
+            )
+
+    return pd.DataFrame(rows)
 
 
 def save_json(path: Path, payload: dict[str, Any]) -> None:

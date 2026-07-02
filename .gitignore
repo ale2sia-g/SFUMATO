@@ -1,5 +1,5 @@
 THEREST/
-venv/
+venv*/
 __pycache__/
 preprocess_cache_*/
 results_*/

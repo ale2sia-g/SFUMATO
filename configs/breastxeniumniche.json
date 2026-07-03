@@ -1,6 +1,6 @@
 {
-  "run_name": "mousexeniumcell",
-  "input_csv": "transcripts_files/xenium_mouse.csv",
+  "run_name": "breastxenium_niche_px10",
+  "input_csv": "transcripts_files/breast_sample1_rep1.csv",
   "columns": {
     "x": "x",
     "y": "y",
@@ -8,19 +8,19 @@
     "num_id": "num_id"
   },
   "preprocess": {
-    "k_list": [45],
+    "k_list": [7, 10, 14, 17],
     "bgm_oversample": 1.5,
     "min_genes_per_bin": 4,
-    "bin_width": 7,
-    "factor": 5,
+    "bin_width": 10,
+    "factor": 4,
     "seed": 8,
-    "comp": 10,
+    "comp": 15,
     "save_p2r": true,
     "alpha": 1.0,
-    "cache_dir": "preprocess_cache_mousexeniumcell"
+    "cache_dir": "preprocess_cache_breastxenium_niche_px10"
   },
   "bgm": {
-    "outroot": "results_mousexeniumcell",
+    "outroot": "results_breastxenium_niche_px10",
     "save_transcript_proba": false,
     "merge_method": "complete",
     "merge_metric": "cosine",
@@ -41,4 +41,3 @@
     "point_size": 0.35
   }
 }
-

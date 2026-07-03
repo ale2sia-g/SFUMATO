@@ -8,13 +8,13 @@
     "num_id": "num_id"
   },
   "preprocess": {
-    "k_list": [45],
+    "k_list": [30, 42, 45],
     "bgm_oversample": 1.5,
     "min_genes_per_bin": 4,
-    "bin_width": 7,
-    "factor": 5,
+    "bin_width": 5,
+    "factor": 4,
     "seed": 8,
-    "comp": 10,
+    "comp": 15,
     "save_p2r": true,
     "alpha": 1.0,
     "cache_dir": "preprocess_cache_mousexeniumcell"

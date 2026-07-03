@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-import matplotlib.colors as mcolors
 import numpy as np
 import pandas as pd
 
@@ -40,7 +39,6 @@ class BGMConfig:
     merge_method: str = "complete"
     merge_metric: str = "cosine"
     bgm_weight_prior: float = 1.0
-
     color_colormap: str = "gist_ncar"
     color_colormap_start: float = 0.08
     color_colormap_end: float = 0.92
@@ -93,7 +91,7 @@ def image_dir_for(cfg: BGMConfig, k: int) -> Path:
 
 
 def shared_result_dir_for(cfg: BGMConfig) -> Path:
-    return cfg.outroot / f"shared_BGM" / f"SVD{cfg.comp}"
+    return cfg.outroot / "shared_BGM" / f"SVD{cfg.comp}"
 
 
 def shared_image_dir_for(cfg: BGMConfig) -> Path:
@@ -318,12 +316,20 @@ def node_members_from_linkage(Z: np.ndarray) -> dict[int, set[int]]:
     return node_members
 
 
+def remap_labels_zero_based(labels: np.ndarray) -> np.ndarray:
+    labels = np.asarray(labels)
+    unique_labels = np.unique(labels)
+    mapping = {old: new for new, old in enumerate(unique_labels)}
+    return np.array([mapping[x] for x in labels], dtype=np.int32)
+
+
 def cluster_spans_for_cut(
     Z: np.ndarray,
     k: int,
     leaf_rank: dict[int, int],
 ) -> tuple[np.ndarray, dict[int, dict[str, Any]]]:
-    labels = fcluster(Z, t=k, criterion="maxclust")
+    labels_raw = fcluster(Z, t=int(k), criterion="maxclust")
+    labels = remap_labels_zero_based(labels_raw)
     spans: dict[int, dict[str, Any]] = {}
 
     for cluster_id in np.unique(labels):
@@ -363,6 +369,8 @@ def colors_for_cut(
 
 def cut_height_for_k(Z: np.ndarray, k: int) -> float | None:
     n_leaves = Z.shape[0] + 1
+    k = int(k)
+
     if k >= n_leaves or k <= 1:
         return None
 
@@ -381,7 +389,7 @@ def link_color_func_for_cut(
     node_members: dict[int, set[int]],
 ) -> Callable[[int], str]:
     def func(node_id: int) -> str:
-        members = node_members[node_id]
+        members = node_members[int(node_id)]
         cls = {int(labels[m]) for m in members}
 
         if len(cls) == 1:
@@ -400,13 +408,6 @@ def link_color_func_multiresolution(
     node_members: dict[int, set[int]],
     color_func: Callable[[float], np.ndarray],
 ) -> Callable[[int], str]:
-    """
-    Color branches using the finest available K first.
-
-    Low branches tend to receive colors from the finest cut. Intermediate
-    branches receive colors from coarser cuts when they are no longer pure at
-    the finest resolution. Branches above the coarsest cut remain grey.
-    """
     k_sorted = sorted([int(k) for k in k_list], reverse=True)
 
     labels_by_k = {}
@@ -418,7 +419,7 @@ def link_color_func_multiresolution(
         colors_by_k[k] = colors_hex
 
     def func(node_id: int) -> str:
-        members = node_members[node_id]
+        members = node_members[int(node_id)]
 
         for k in k_sorted:
             labels = labels_by_k[k]
@@ -456,16 +457,18 @@ def plot_multiresolution_dendrogram(
 
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    k_list = [int(k) for k in k_list]
+    n_leaves = Z.shape[0] + 1
     leaf_rank = leaf_rank_from_linkage(Z)
     node_members = node_members_from_linkage(Z)
 
     fig_height = 7.5 + 0.38 * len(k_list)
     fig, ax = plt.subplots(figsize=(15, fig_height), dpi=220)
 
-    d = dendrogram(
+    dendro = dendrogram(
         Z,
         ax=ax,
-        labels=[str(i) for i in range(Z.shape[0] + 1)],
+        labels=[str(i) for i in range(n_leaves)],
         leaf_rotation=90,
         leaf_font_size=6,
         link_color_func=link_color_func_multiresolution(
@@ -480,8 +483,8 @@ def plot_multiresolution_dendrogram(
 
     thicken_dendrogram_lines(ax, linewidth=branch_linewidth)
 
-    displayed_leaves = d["leaves"]
-    x_by_leaf = {leaf: 5 + 10 * i for i, leaf in enumerate(displayed_leaves)}
+    displayed_leaves = dendro["leaves"]
+    x_by_leaf = {int(leaf): 5 + 10 * i for i, leaf in enumerate(displayed_leaves)}
 
     _, ymax = ax.get_ylim()
     strip_h = 0.045 * ymax
@@ -489,7 +492,7 @@ def plot_multiresolution_dendrogram(
     base_y = -strip_h - gap
 
     for k in k_list:
-        h = cut_height_for_k(Z, int(k))
+        h = cut_height_for_k(Z, k)
         if h is None:
             continue
 
@@ -503,7 +506,7 @@ def plot_multiresolution_dendrogram(
         ax.text(
             ax.get_xlim()[1] + 5,
             h,
-            f"K={int(k)}",
+            f"K={k}",
             va="center",
             ha="left",
             fontsize=8,
@@ -511,13 +514,13 @@ def plot_multiresolution_dendrogram(
         )
 
     for row, k in enumerate(k_list):
-        labels, spans, colors_hex, _ = colors_for_cut(Z, int(k), leaf_rank, color_func)
+        _, spans, colors_hex, _ = colors_for_cut(Z, k, leaf_rank, color_func)
         y = base_y - row * (strip_h + gap)
 
         ax.text(
             -12,
             y + strip_h / 2,
-            f"K={int(k)}",
+            f"K={k}",
             va="center",
             ha="right",
             fontsize=9,
@@ -566,17 +569,19 @@ def plot_cut_dendrogram(
 
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    k = int(k)
+    n_leaves = Z.shape[0] + 1
     leaf_rank = leaf_rank_from_linkage(Z)
     node_members = node_members_from_linkage(Z)
 
-    labels, spans, colors_hex, _ = colors_for_cut(Z, int(k), leaf_rank, color_func)
+    labels, spans, colors_hex, _ = colors_for_cut(Z, k, leaf_rank, color_func)
 
-    fig, ax = plt.subplots(figsize=(15, 6.5), dpi=220)
+    fig, ax = plt.subplots(figsize=(15, 6.8), dpi=220)
 
-    d = dendrogram(
+    dendro = dendrogram(
         Z,
         ax=ax,
-        labels=[str(i) for i in range(Z.shape[0] + 1)],
+        labels=[str(i) for i in range(n_leaves)],
         leaf_rotation=90,
         leaf_font_size=6,
         link_color_func=link_color_func_for_cut(labels, colors_hex, node_members),
@@ -585,14 +590,15 @@ def plot_cut_dendrogram(
 
     thicken_dendrogram_lines(ax, linewidth=branch_linewidth)
 
-    displayed_leaves = d["leaves"]
-    x_by_leaf = {leaf: 5 + 10 * i for i, leaf in enumerate(displayed_leaves)}
+    displayed_leaves = dendro["leaves"]
+    x_by_leaf = {int(leaf): 5 + 10 * i for i, leaf in enumerate(displayed_leaves)}
 
     _, ymax = ax.get_ylim()
     strip_h = 0.05 * ymax
-    y = -strip_h * 1.6
+    gap = 0.025 * ymax
+    y = -strip_h - gap
 
-    h = cut_height_for_k(Z, int(k))
+    h = cut_height_for_k(Z, k)
     if h is not None:
         ax.axhline(
             h,
@@ -604,12 +610,23 @@ def plot_cut_dendrogram(
         ax.text(
             ax.get_xlim()[1] + 5,
             h,
-            f"K={int(k)}",
+            f"K={k}",
             va="center",
             ha="left",
             fontsize=8,
             color="#333333",
         )
+
+    ax.text(
+        -12,
+        y + strip_h / 2,
+        f"K={k}",
+        va="center",
+        ha="right",
+        fontsize=9,
+    )
+
+    label_y = y - 0.02 * ymax
 
     for cluster_id, info in spans.items():
         members = info["members"]
@@ -631,14 +648,15 @@ def plot_cut_dendrogram(
 
         ax.text(
             x0 + width / 2,
-            y - 0.02 * ymax,
+            label_y,
             f"C{int(cluster_id)}",
             ha="center",
             va="top",
             fontsize=7,
+            clip_on=False,
         )
 
-    ax.set_ylim(y - 0.12 * ymax, ymax)
+    ax.set_ylim(y - 0.13 * ymax, ymax)
     ax.set_title(title, fontsize=13)
     ax.set_ylabel("linkage distance")
     ax.set_xlabel("oversampled BGM components")

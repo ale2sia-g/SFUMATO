@@ -4,6 +4,7 @@ __pycache__/
 preprocess_cache_*/
 results_*/
 preprocess_xenium_data/
+ficture_output/
 
 *.out
 *.err

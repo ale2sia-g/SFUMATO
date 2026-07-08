@@ -18,7 +18,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 import numpy as np
 import pandas as pd
 
-from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.cluster.hierarchy import linkage
 
 from bgm.bgm_pure_torch_lb import BayesianGaussianMixtureTorch
 from utils_bgm import (
@@ -39,7 +39,6 @@ from utils_bgm import (
     plot_cut_dendrogram,
     plot_multiresolution_dendrogram,
     result_dir_for,
-    rgb01_to_hex,
     safe_cosine_pdist,
     save_json,
     shared_bgm_stem_for,
@@ -290,8 +289,15 @@ def run_bgm(config: dict) -> None:
         print(f"Cutting shared dendrogram to K={k}", flush=True)
         print(f"Output directory: {outdir}", flush=True)
 
-        merge_labels = fcluster(Z_link, t=k, criterion="maxclust")
+        merge_labels, spans, colors_hex_by_label, colors_rgb_by_label = colors_for_cut(
+            Z_link,
+            k,
+            leaf_rank,
+            color_func,
+        )
+
         unique_merge_labels = np.unique(merge_labels)
+
         proba, groups = merge_probabilities_from_labels(proba_bgm, merge_labels)
 
         centroids_final, masses_final = merge_centroids_by_groups(
@@ -302,13 +308,6 @@ def run_bgm(config: dict) -> None:
 
         actual_k = proba.shape[1]
         print(f"  Final clusters: {actual_k}", flush=True)
-
-        _, spans, colors_hex_by_label, colors_rgb_by_label = colors_for_cut(
-            Z_link,
-            k,
-            leaf_rank,
-            color_func,
-        )
 
         centroid_colors = [
             colors_rgb_by_label[int(label)] for label in unique_merge_labels

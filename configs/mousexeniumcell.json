@@ -21,7 +21,7 @@
   },
   "bgm": {
     "outroot": "results_mousexeniumcell",
-    "save_transcript_proba": false,
+    "save_transcript_proba": true,
     "merge_method": "complete",
     "merge_metric": "cosine",
     "bgm_weight_prior": 1
@@ -33,7 +33,7 @@
     "dendrogram_branch_linewidth": 3.0
   },
   "umap": {
-    "run": false,
+    "run": true,
     "max_points": 200000,
     "umap_components": 3,
     "n_neighbors": 30,

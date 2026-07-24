@@ -1,6 +1,6 @@
 {
-  "run_name": "breastxenium_cell",
-  "input_csv": "transcripts_files/breast_sample1_rep1.csv",
+  "run_name": "breast2xenium_cell",
+  "input_csv": "transcripts_files/breast_sample2.csv",
   "columns": {
     "x": "x",
     "y": "y",
@@ -10,17 +10,17 @@
   "preprocess": {
     "k_list": [13, 17, 20, 22],
     "bgm_oversample": 1.5,
-    "min_genes_per_bin": 20,
+    "min_genes_per_bin": 10,
     "bin_width": 10,
     "factor": 6,
     "seed": 8,  
     "comp": 10,
     "save_p2r": false,
     "alpha": 1.0,
-    "cache_dir": "preprocess_cache_breastxenium_cell"
+    "cache_dir": "preprocess_cache_breast2xenium_cell"
   },
   "bgm": {
-    "outroot": "results_breastxenium_cell",
+    "outroot": "results_breast2xenium_cell",
     "save_transcript_proba": false,
     "merge_method": "complete",
     "merge_metric": "cosine",

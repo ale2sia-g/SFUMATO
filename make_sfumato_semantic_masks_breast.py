@@ -51,14 +51,15 @@ def parse_args():
     p.add_argument("--low-threshold", type=float, default=0.10)
     p.add_argument("--high-threshold", type=float, default=0.30)
     p.add_argument("--threshold-scale", choices=("relative", "absolute"), default="relative")
+    p.add_argument("--min-object-area-px", type=int, default=None)
+    p.add_argument("--max-hole-area-px", type=int, default=None)
 
     p.add_argument("--annotation-invasive-regex", default="invasive")
-    p.add_argument("--annotation-dcis-regex", default=r"dcis\\s*1|dcis1|dcis\\s*2|dcis2")
+    p.add_argument("--annotation-dcis-regex", default=r"dcis")
     p.add_argument(
         "--annotation-label-fields",
         nargs="+",
         default=["classification.name", "class", "name", "label"],
-        help="GeoJSON property fields searched for annotation labels. Use dots for nested fields.",
     )
     p.add_argument("--plot-max-dim", type=int, default=3000)
     return p.parse_args()
@@ -98,11 +99,8 @@ def load_bin_coordinates(bin_csv, bin_id_col, x_col, y_col):
 
 def load_group_posteriors(transcript_csv, bin_id_col, invasive_cols, dcis_cols):
     usecols = [bin_id_col] + sorted(set(invasive_cols + dcis_cols))
-
     print("Loading one posterior vector per bin...", flush=True)
     df = pd.read_csv(transcript_csv, usecols=usecols)
-
-    # All transcripts in the same true bin_id should share the same posterior vector.
     df = df.drop_duplicates(subset=[bin_id_col], keep="first")
     df[bin_id_col] = df[bin_id_col].astype(np.int64)
 
@@ -114,9 +112,6 @@ def load_group_posteriors(transcript_csv, bin_id_col, invasive_cols, dcis_cols):
     out.index.name = bin_id_col
     out["Invasive"] = df[invasive_cols].sum(axis=1).to_numpy(dtype=np.float32)
     out["DCIS_like"] = df[dcis_cols].sum(axis=1).to_numpy(dtype=np.float32)
-
-    # Group posteriors should be in [0, 1] when the selected clusters are disjoint
-    # posterior classes. Clip defensively in case duplicated columns were passed.
     out["Invasive"] = out["Invasive"].clip(0.0, 1.0)
     out["DCIS_like"] = out["DCIS_like"].clip(0.0, 1.0)
     return out
@@ -125,15 +120,7 @@ def load_group_posteriors(transcript_csv, bin_id_col, invasive_cols, dcis_cols):
 def rasterize_bins_as_squares(x, y, p, width, height, bin_size):
     image = np.zeros((height, width), dtype=np.float32)
     half = bin_size // 2
-
-    valid = (
-        (x >= 0)
-        & (x < width)
-        & (y >= 0)
-        & (y < height)
-        & np.isfinite(p)
-        & (p > 0)
-    )
+    valid = (x >= 0) & (x < width) & (y >= 0) & (y < height) & np.isfinite(p) & (p > 0)
 
     xv = x[valid]
     yv = y[valid]
@@ -152,7 +139,6 @@ def rasterize_bins_as_squares(x, y, p, width, height, bin_size):
 
 def reconstruction_mask(smoothed, low_thr, high_thr, threshold_scale):
     max_val = float(np.nanmax(smoothed))
-
     if max_val <= 0:
         return np.zeros(smoothed.shape, dtype=bool), 0.0, 0.0, max_val
 
@@ -169,10 +155,59 @@ def reconstruction_mask(smoothed, low_thr, high_thr, threshold_scale):
     seed = smoothed >= high
     mask = smoothed >= low
     reconstructed = ndi.binary_propagation(seed, mask=mask)
-
     del seed, mask
     gc.collect()
     return reconstructed, float(low), float(high), max_val
+
+
+def remove_small_objects(mask, min_area_px):
+    if min_area_px is None or min_area_px <= 0:
+        return mask
+
+    labels, n_labels = ndi.label(mask)
+    if n_labels == 0:
+        return mask
+
+    counts = np.bincount(labels.ravel())
+    keep = counts >= int(min_area_px)
+    keep[0] = False
+    cleaned = keep[labels]
+    del labels, counts, keep
+    gc.collect()
+    return cleaned
+
+
+def fill_small_holes(mask, max_hole_area_px):
+    if max_hole_area_px is None or max_hole_area_px <= 0:
+        return mask
+
+    inv = ~mask
+    labels, n_labels = ndi.label(inv)
+    if n_labels == 0:
+        return mask
+
+    border_labels = set(np.unique(labels[0, :]))
+    border_labels.update(np.unique(labels[-1, :]))
+    border_labels.update(np.unique(labels[:, 0]))
+    border_labels.update(np.unique(labels[:, -1]))
+
+    counts = np.bincount(labels.ravel())
+    fill = np.zeros(n_labels + 1, dtype=bool)
+    for label_id in range(1, n_labels + 1):
+        if label_id not in border_labels and counts[label_id] <= int(max_hole_area_px):
+            fill[label_id] = True
+
+    filled = mask | fill[labels]
+    del inv, labels, counts, fill
+    gc.collect()
+    return filled
+
+
+def clean_binary_mask(mask, min_object_area_px, max_hole_area_px):
+    cleaned = remove_small_objects(mask, min_object_area_px)
+    cleaned = fill_small_holes(cleaned, max_hole_area_px)
+    cleaned = remove_small_objects(cleaned, min_object_area_px)
+    return cleaned
 
 
 def save_mask(mask, path):
@@ -224,7 +259,6 @@ def feature_label(feature, label_fields):
 def iter_polygon_rings(geometry):
     gtype = geometry.get("type")
     coords = geometry.get("coordinates", [])
-
     if gtype == "Polygon":
         for ring in coords[:1]:
             yield ring
@@ -321,6 +355,35 @@ def plot_mask_comparison(pred_masks, annotation_masks, output_path, max_dim=3000
     plt.close(fig)
 
 
+def overlap_rgb(pred, annotation):
+    pred = pred.astype(bool, copy=False)
+    annotation = annotation.astype(bool, copy=False)
+    overlap = pred & annotation
+    pred_only = pred & ~annotation
+    annotation_only = annotation & ~pred
+
+    rgb = np.zeros((*pred.shape, 3), dtype=np.uint8)
+    rgb[pred_only, 0] = 255
+    rgb[annotation_only, 1] = 255
+    rgb[overlap, 2] = 255
+    return rgb
+
+
+def plot_overlap_rgb(pred_masks, annotation_masks, output_path, max_dim=3000):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6), constrained_layout=True)
+
+    for ax, name in zip(axes, ["Invasive", "DCIS_like"]):
+        rgb = overlap_rgb(pred_masks[name], annotation_masks[name])
+        shown = display_image(rgb, max_dim)
+        ax.imshow(shown)
+        ax.set_title(f"{name}: SFUMATO red, annotation green, overlap blue")
+        ax.axis("off")
+        del rgb, shown
+
+    fig.savefig(output_path, dpi=250)
+    plt.close(fig)
+
+
 def main():
     args = parse_args()
 
@@ -328,6 +391,17 @@ def main():
     pixel_area_um2 = args.pixel_size_um ** 2
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    min_object_area_px = (
+        int(args.min_object_area_px)
+        if args.min_object_area_px is not None
+        else int((3 * args.bin_size) ** 2)
+    )
+    max_hole_area_px = (
+        int(args.max_hole_area_px)
+        if args.max_hole_area_px is not None
+        else int((4 * args.bin_size) ** 2)
+    )
 
     invasive_cols, dcis_cols = selected_prob_cols(args)
     all_cols = invasive_cols + dcis_cols
@@ -391,7 +465,9 @@ def main():
             args.high_threshold,
             args.threshold_scale,
         )
+        mask = clean_binary_mask(mask, min_object_area_px, max_hole_area_px)
         pred_masks[group_name] = mask
+
         mask_path = out_dir / f"{group_name}_mask.png"
         save_mask(mask, mask_path)
 
@@ -405,6 +481,8 @@ def main():
             "smoothed_max": float(smoothed_max),
             "low_threshold_used": float(low_used),
             "high_threshold_used": float(high_used),
+            "min_object_area_px": int(min_object_area_px),
+            "max_hole_area_px": int(max_hole_area_px),
         }
 
         del raw, smoothed, mask
@@ -453,6 +531,12 @@ def main():
         output_path=out_dir / "semantic_masks_vs_annotations.png",
         max_dim=args.plot_max_dim,
     )
+    plot_overlap_rgb(
+        pred_masks,
+        annotation_masks,
+        output_path=out_dir / "semantic_mask_annotation_overlap_rgb.png",
+        max_dim=args.plot_max_dim,
+    )
 
     summary = {
         "input_bin_csv": str(args.bin_csv),
@@ -468,6 +552,8 @@ def main():
         "threshold_scale": args.threshold_scale,
         "low_threshold_input": float(args.low_threshold),
         "high_threshold_input": float(args.high_threshold),
+        "min_object_area_px": int(min_object_area_px),
+        "max_hole_area_px": int(max_hole_area_px),
         "invasive_clusters": args.invasive_clusters,
         "invasive_posterior_columns": invasive_cols,
         "dcis_clusters": args.dcis_clusters,
@@ -480,6 +566,7 @@ def main():
             "raw_posterior_subplot": str(out_dir / "semantic_posteriors_raw.png"),
             "smoothed_posterior_subplot": str(out_dir / "semantic_posteriors_smoothed.png"),
             "mask_annotation_subplot": str(out_dir / "semantic_masks_vs_annotations.png"),
+            "mask_annotation_overlap_rgb": str(out_dir / "semantic_mask_annotation_overlap_rgb.png"),
         },
         "semantic_classes": stats,
     }

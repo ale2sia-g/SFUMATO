@@ -10,7 +10,7 @@ set -euo pipefail
 
 WORKDIR=/mimer/NOBACKUP/groups/digital_pathology/bayesian_clustering
 IMAGE=${WORKDIR}/bgm-gpu_v1.sif
-CONFIG=/workspace/configs/mousexeniumcell.json
+CONFIG=/workspace/configs/breastxeniumniche.json
 
 apptainer exec \
     --bind ${WORKDIR}:/workspace \

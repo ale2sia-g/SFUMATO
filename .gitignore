@@ -7,6 +7,7 @@ preprocess_xenium_data/
 ficture_output/
 cluster_masks_K45_BIN7_cell_level_SVD10_binlevel_low010_high030/
 transcripts_files/
+semantic_masks*/
 
 *.out
 *.err

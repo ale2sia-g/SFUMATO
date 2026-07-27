@@ -272,8 +272,6 @@ def run_bgm(config: dict) -> None:
         },
     )
 
-    X_svd3 = first_svd_dims(X_norm, n_dims=3)
-
     for k in k_list:
         stem = bgm_stem_for(cfg, k, k_bgm)
         outdir = result_dir_for(cfg, k)
@@ -328,6 +326,11 @@ def run_bgm(config: dict) -> None:
 
         cluster, second_cluster, p1, p2 = top2_from_proba(proba)
 
+        alpha = 50.0
+        w1 = np.log1p(alpha * p1)
+        w2 = np.log1p(alpha * p2)
+        mix_t = (w2 / (w1 + w2)).astype(np.float32)
+
         df_bins = pd.DataFrame(
             {
                 "bin_id": good_bin_ids,
@@ -338,9 +341,7 @@ def run_bgm(config: dict) -> None:
                 "p1": p1,
                 "p2": p2,
                 "compl_p1": 1 - p1,
-                "PC1": X_svd3[:, 0],
-                "PC2": X_svd3[:, 1],
-                "PC3": X_svd3[:, 2],
+                "mix_t": mix_t,
             }
         )
 
@@ -369,12 +370,11 @@ def run_bgm(config: dict) -> None:
                 [
                     "bin_id",
                     "cluster",
+                    "second_cluster",
                     "color_hard_hsv",
                     "color_log_hsv",
                     "compl_p1",
-                    "PC1",
-                    "PC2",
-                    "PC3",
+                    "mix_t",
                 ]
             ],
             on="bin_id",
@@ -382,6 +382,12 @@ def run_bgm(config: dict) -> None:
         )
         df_mappedback["cluster"] = (
             df_mappedback["cluster"].fillna(-1).astype(int).astype("category")
+        )
+        df_mappedback["second_cluster"] = (
+            df_mappedback["second_cluster"]
+            .fillna(-1)
+            .astype(int)
+            .astype("category")
         )
 
         if cfg.save_p2r:
@@ -506,7 +512,7 @@ def run_bgm(config: dict) -> None:
         del proba, groups, centroids_final, masses_final
         del merge_labels, unique_merge_labels
         del centroid_colors, centroid_colors_hex
-        del cluster, second_cluster, p1, p2
+        del cluster, second_cluster, p1, p2, mix_t, w1, w2
         del df_bins, df_mappedback, df_colors, adata_output
         if cfg.save_p2r:
             del cluster_p2r_bins, p2r_color_bins
@@ -515,7 +521,7 @@ def run_bgm(config: dict) -> None:
 
     data.close()
 
-    del data, X_norm, X_svd3, proba_bgm, bgm
+    del data, X_norm, proba_bgm, bgm
     del centroids_bgm, masses_bgm, d_all, Z_link, color_table
     del good_bin_ids, pos, back_map
     del gene_x, gene_y, gene_name, gene_bin_id, df_run

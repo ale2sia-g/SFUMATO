@@ -314,6 +314,15 @@ def run_bgm(config: dict) -> None:
             colors_hex_by_label[int(label)] for label in unique_merge_labels
         ]
 
+        n_leaves = Z_link.shape[0] + 1
+        centroid_cmap_pos = np.asarray(
+            [
+                spans[int(label)]["rank_center"] / max(n_leaves - 1, 1)
+                for label in unique_merge_labels
+            ],
+            dtype=np.float32,
+        )
+
         plot_cut_dendrogram(
             Z=Z_link,
             k=k,
@@ -342,6 +351,7 @@ def run_bgm(config: dict) -> None:
                 "p2": p2,
                 "compl_p1": 1 - p1,
                 "mix_t": mix_t,
+                "cmap_pos": centroid_cmap_pos[cluster],
             }
         )
 
@@ -375,6 +385,7 @@ def run_bgm(config: dict) -> None:
                     "color_log_hsv",
                     "compl_p1",
                     "mix_t",
+                    "cmap_pos",
                 ]
             ],
             on="bin_id",
@@ -401,6 +412,7 @@ def run_bgm(config: dict) -> None:
                 "cluster": np.arange(actual_k),
                 "merge_label": unique_merge_labels.astype(int),
                 "color_hex": centroid_colors_hex,
+                "cmap_pos": centroid_cmap_pos,
                 "n_oversampled_components": [
                     len(spans[int(label)]["members"]) for label in unique_merge_labels
                 ],
@@ -511,7 +523,7 @@ def run_bgm(config: dict) -> None:
 
         del proba, groups, centroids_final, masses_final
         del merge_labels, unique_merge_labels
-        del centroid_colors, centroid_colors_hex
+        del centroid_colors, centroid_colors_hex, centroid_cmap_pos
         del cluster, second_cluster, p1, p2, mix_t, w1, w2
         del df_bins, df_mappedback, df_colors, adata_output
         if cfg.save_p2r:

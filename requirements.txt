@@ -1,0 +1,24 @@
+# Core
+numpy
+scipy
+pandas
+matplotlib
+scikit-learn
+scikit-image
+h5py
+tqdm
+
+# Spatial transcriptomics
+points2regions
+anndata
+scanpy
+
+# Deep learning (GPU required for BGM)
+# Install the CUDA-enabled build from https://pytorch.org
+torch
+
+# Optional — UMAP visualisation
+umap-learn
+
+# Optional — mask generation (make_masks/)
+opencv-python

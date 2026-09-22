@@ -1,0 +1,43 @@
+{
+  "run_name": "breastxenium_cell_px7",
+  "input_csv": "transcripts_files/breast_sample1_rep1.csv",
+  "columns": {
+    "x": "x",
+    "y": "y",
+    "gene": "target_name",
+    "num_id": "num_id"
+  },
+  "preprocess": {
+    "k_list": [17, 20, 22],
+    "bgm_oversample": 1.5,
+    "min_genes_per_bin": 4,
+    "bin_width": 7,
+    "factor": 2,
+    "seed": 8,
+    "comp": 25,
+    "save_p2r": false,
+    "alpha": 1.0,
+    "cache_dir": "preprocess_cache_breastxenium_cell_px7"
+  },
+  "bgm": {
+    "outroot": "results_breastxenium_cell_px7",
+    "save_transcript_proba": false,
+    "merge_method": "complete",
+    "merge_metric": "cosine",
+    "bgm_weight_prior": 1
+  },
+  "color": {
+    "colormap": "gist_ncar",
+    "colormap_start": 0.08,
+    "colormap_end": 0.92,
+    "dendrogram_branch_linewidth": 3.0
+  },
+  "umap": {
+    "run": false,
+    "max_points": 200000,
+    "umap_components": 3,
+    "n_neighbors": 30,
+    "min_dist": 0.15,
+    "point_size": 0.35
+  }
+}

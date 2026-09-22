@@ -65,8 +65,8 @@ def read_bin_metadata(bin_csv: Path | None) -> pd.DataFrame | None:
     cols_try = [
         "bin_id",
         "cluster",
-        "color_hard_hsv",
-        "color_log_hsv",
+        "color_hard",
+        "color_mixed",
         "color_p2r",
         "p1",
         "compl_p1",
@@ -264,8 +264,8 @@ def plot_for_k(
 
     if meta_sub is not None:
         for col, suffix, title in [
-            ("color_hard_hsv", "umap_sfumato_hard_colors", "SFUMATO hard colors"),
-            ("color_log_hsv", "umap_sfumato_mixed_colors", "SFUMATO mixed colors"),
+            ("color_hard", "umap_sfumato_hard_colors", "SFUMATO hard colors"),
+            ("color_mixed", "umap_sfumato_mixed_colors", "SFUMATO mixed colors"),
             ("color_p2r", "umap_color_p2r", "P2R colors"),
         ]:
             if col in meta_sub.columns:

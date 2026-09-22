@@ -355,10 +355,10 @@ def run_bgm(config: dict) -> None:
             }
         )
 
-        df_bins["color_hard_hsv"] = df_bins["cluster"].apply(
+        df_bins["color_hard"] = df_bins["cluster"].apply(
             lambda c: centroid_colors_hex[int(c)]
         )
-        df_bins["color_log_hsv"] = df_bins.apply(
+        df_bins["color_mixed"] = df_bins.apply(
             lambda row: color_mix_top2_log(
                 centroid_colors[int(row["cluster"])],
                 centroid_colors[int(row["second_cluster"])],
@@ -381,8 +381,8 @@ def run_bgm(config: dict) -> None:
                     "bin_id",
                     "cluster",
                     "second_cluster",
-                    "color_hard_hsv",
-                    "color_log_hsv",
+                    "color_hard",
+                    "color_mixed",
                     "compl_p1",
                     "mix_t",
                     "cmap_pos",
@@ -483,8 +483,8 @@ def run_bgm(config: dict) -> None:
                     "y": gene_y.astype(np.int32),
                     "target_name": gene_name,
                     "bin_id": transcript_bin_ids.astype(np.int32),
-                    "color_hard_hsv": df_mappedback["color_hard_hsv"].to_numpy(),
-                    "color_log_hsv": df_mappedback["color_log_hsv"].to_numpy(),
+                    "color_hard": df_mappedback["color_hard"].to_numpy(),
+                    "color_mixed": df_mappedback["color_mixed"].to_numpy(),
                 }
             )
 

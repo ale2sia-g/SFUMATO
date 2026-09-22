@@ -232,7 +232,7 @@ def csv_to_h5ad(df: pd.DataFrame):
 
     adata_o = ad.AnnData(obs=df)
 
-    for col in ["color_hard_hsv", "color_log_hsv", "color_p2r"]:
+    for col in ["color_hard", "color_mixed", "color_p2r"]:
         if col in adata_o.obs.columns:
             adata_o.obs[col] = (
                 adata_o.obs[col].replace("NaN", "#000000").fillna("#000000")

@@ -1,6 +1,6 @@
 # SFUMATO
 
-## A Bayesian probabilistic clustering and visualisation method for uncertainty-aware spatial transcriptomics
+## Bayesian probabilistic clustering for uncertainty-aware spatial transcriptomics analysis and mapping
 
 <p align="center">
   <img src="assets/monalisa.png" width="150" alt="MonaLisa logo">
@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <strong>Developed at Uppsala University in the Wählby group</strong>
+  <strong>Developed at Uppsala University, Wählby group</strong>
 </p>
 
 ---
@@ -21,8 +21,6 @@ The pipeline is config-driven: the same config file is used for CPU preprocessin
 
 ## Repository Structure
 
-Recommended structure:
-
 ```text
 SFUMATO/
   bgm/
@@ -32,18 +30,37 @@ SFUMATO/
     memory_utils.py
 
   configs/
-    mousexeniumniche.json
+    mousexeniumniche.json       ← example config (mouse Xenium, niche level)
+    mousexeniumcell.json
+    breastxeniumniche.json
+    breastxeniumcell.json
+    ...
+
+  make_masks/
+    make_cluster_masks_from_binlevel_posterior.py
+    make_sfumato_semantic_masks_breast.py
+
+  notebooks/
+    examples/
+      sfumato_full_pipeline.ipynb         ← full pipeline walkthrough with toy data
+      sfumato_bgm_custom_features.ipynb   ← run BGM on your own pre-computed features
+      embedding_from_cache.ipynb
+    paper_analysis/
+      compare_sfumato_ficture.ipynb
+      compare_sfumato_points2regions.ipynb
+      compare_sfumato_xenium.ipynb
+      dge_cell_level_45_clusters_dendrogram_aligned_plot_only.ipynb
+
+  plots_umap/
+    plot_embedding_dims.py
+    plot_embedding_umap.py
 
   sbatch/
     preprocess.sbatch
     run_bgm_gpu.sbatch
     submit_pipeline.sh
 
-  transcripts_files/
-    xenium_mouse.csv
-
-  notebooks/
-  assets/
+  transcripts_files/            ← place your input CSV here (not tracked by git)
 
   points2regions.py
   preprocess.py
@@ -52,27 +69,47 @@ SFUMATO/
   utils_bgm.py
   utils_config.py
   utils_preprocess.py
+  requirements.txt
 ```
 
-Transcript-level input files should be placed in:
-
-```text
-transcripts_files/
-```
-
-For example:
+Transcript-level input files should be placed in `transcripts_files/`. For example:
 
 ```json
 "input_csv": "transcripts_files/xenium_mouse.csv"
 ```
 
-## Main Config
-
-Example:
+## Installation
 
 ```bash
-configs/mousexeniumniche.json
+pip install -r requirements.txt
 ```
+
+PyTorch must be installed with CUDA support. See [pytorch.org](https://pytorch.org) for the correct command for your CUDA version. For example:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+```
+
+## Quick Start
+
+See `notebooks/examples/sfumato_full_pipeline.ipynb` for a complete walkthrough.
+
+To run from the command line:
+
+```bash
+python run_sfumato.py --config configs/mousexeniumniche.json
+```
+
+Or run the two steps separately:
+
+```bash
+python preprocess.py --config configs/mousexeniumniche.json
+python run_bgm_gpu.py --config configs/mousexeniumniche.json
+```
+
+## Main Config
+
+Example config file: `configs/mousexeniumniche.json`
 
 The config controls:
 
@@ -85,8 +122,6 @@ The config controls:
 - output directories
 - hierarchical colour assignment
 - optional UMAP settings
-
-Example structure:
 
 ```json
 {
@@ -170,14 +205,7 @@ K_max = max(k_list)
 K_bgm = ceil(bgm_oversample * K_max)
 ```
 
-For example, if:
-
-```json
-"k_list": [15, 20, 25, 30],
-"bgm_oversample": 1.5
-```
-
-then:
+For example, with `k_list = [15, 20, 25, 30]` and `bgm_oversample = 1.5`:
 
 ```text
 K_max = 30
@@ -191,8 +219,6 @@ The GPU step then:
 3. builds one shared hierarchical dendrogram of the oversampled components;
 4. cuts the same dendrogram at each requested K;
 5. saves one set of outputs for each K.
-
-This ensures that different K resolutions are derived from the same model and the same dendrogram.
 
 ## Hierarchical Colour Assignment
 
@@ -208,90 +234,21 @@ The default colour ramp is:
 }
 ```
 
-This uses a trimmed `gist_ncar` colormap to avoid the darkest and most extreme endpoints while preserving a broad range of distinguishable colours.
-
 For each K:
 
 1. the shared dendrogram is cut at K;
 2. each final cluster receives a colour according to the span of its oversampled BGM components along the optimal dendrogram leaf ordering;
 3. finer K values inherit related colours from the same broader dendrogram branches.
 
-This gives colour consistency across resolutions: a broad branch at low K is split into related colour shades at higher K.
-
-The user can choose another Matplotlib continuous colormap in the config. For example, colourblind-friendly alternatives can be tested with:
+Colourblind-friendly alternatives:
 
 ```json
-"color": {
-  "colormap": "viridis",
-  "colormap_start": 0.0,
-  "colormap_end": 1.0
-}
+"color": { "colormap": "viridis", "colormap_start": 0.0, "colormap_end": 1.0 }
 ```
-
-or:
-
-```json
-"color": {
-  "colormap": "cividis",
-  "colormap_start": 0.0,
-  "colormap_end": 1.0
-}
-```
-
-Note that different colormaps have different perceptual properties. The default `gist_ncar` setting prioritises visual separability across many clusters.
-
-## Local / Workstation
-
-Run preprocessing and BGM in one command:
-
-```bash
-python run_sfumato.py --config configs/mousexeniumniche.json
-```
-
-Or run the two steps separately:
-
-```bash
-python preprocess.py --config configs/mousexeniumniche.json
-python run_bgm_gpu.py --config configs/mousexeniumniche.json
-```
-
-To overwrite an existing preprocessing cache:
-
-```bash
-python preprocess.py --config configs/mousexeniumniche.json --force
-```
-
-or:
-
-```bash
-python run_sfumato.py --config configs/mousexeniumniche.json --force-preprocess
-```
-
-## Alvis / SLURM
-
-Submit preprocessing and BGM as separate jobs with dependency:
-
-```bash
-bash sbatch/submit_pipeline.sh
-```
-
-The preprocessing job uses:
-
-```bash
-sbatch/preprocess.sbatch
-```
-
-The GPU job uses:
-
-```bash
-sbatch/run_bgm_gpu.sbatch
-```
-
-For CPU-only preprocessing on Alvis, memory is allocated proportionally to requested CPU cores. For high-memory preprocessing, use the appropriate NOGPU memory feature and CPU allocation for the target node type.
 
 ## Outputs
 
-Example preprocessing cache:
+### Preprocessing cache
 
 ```text
 preprocess_cache_mousexeniumniche/
@@ -299,36 +256,50 @@ preprocess_cache_mousexeniumniche/
   mousexeniumniche_BIN40_F8_SVD10_preprocess_config.json
 ```
 
-Shared BGM outputs:
+### Shared BGM outputs
 
 ```text
 results_mousexeniumniche/
-  shared_BGM/
-    SVD10/
-      mousexeniumniche_BGM45toMAX30_BIN40_F8_SVD10_cluster_color_table_allK.csv
-      mousexeniumniche_BGM45toMAX30_BIN40_F8_SVD10_oversampled_merge_distances.csv
-      mousexeniumniche_BGM45toMAX30_BIN40_F8_SVD10_shared_bgm_config.json
-      weights_mousexeniumniche_BGM45toMAX30_BIN40_F8_SVD10.txt
-      images/
-        mousexeniumniche_BGM45toMAX30_BIN40_F8_SVD10_multiresolution_dendrogram_allK.png
+  shared_BGM/SVD10/
+    *_cluster_color_table_allK.csv
+    *_oversampled_merge_distances.csv
+    *_shared_bgm_config.json
+    weights_*.txt
+    images/
+      *_multiresolution_dendrogram_allK.png
 ```
 
-K-specific outputs:
+### K-specific outputs
 
 ```text
 results_mousexeniumniche/
-  K30/
-    SVD10/
-      *_FULL.h5ad
-      *_binlevel_FULL.csv
-      colors_*.csv
-      weights_*.txt
-      *_bgm_config.json
-      images/
-        *_cut_dendrogram.png
+  K30/SVD10/
+    *_FULL.h5ad
+    *_binlevel_FULL.csv
+    colors_*.csv
+    weights_*.txt
+    *_bgm_config.json
+    images/
+      *_cut_dendrogram.png
 ```
 
-The transcript-level probability CSV is skipped by default. Enable it with:
+### Column legend — `_binlevel_FULL.csv`
+
+| Column | Description |
+|--------|-------------|
+| `x`, `y` | Bin spatial coordinates |
+| `bin_id` | Global bin index |
+| `cluster` | Index of the dominant cluster (0-based) |
+| `second_cluster` | Index of the second-best cluster |
+| `p1` | Probability of the dominant cluster |
+| `p2` | Probability of the second-best cluster |
+| `compl_p1` | `1 − p1` — uncertainty (0 = certain, ~1 = ambiguous) |
+| `mix_t` | Blend weight toward second cluster: `log1p(α·p2) / (log1p(α·p1) + log1p(α·p2))` |
+| `cmap_pos` | Cluster position along the dendrogram colour axis [0, 1] |
+| `color_hard` | Hex colour of the dominant cluster |
+| `color_mixed` | Hex colour blending top-2 clusters by log-probability — **recommended for visualisation** |
+
+The transcript-level probability CSV is skipped by default. Enable with:
 
 ```json
 "save_transcript_proba": true
@@ -336,59 +307,41 @@ The transcript-level probability CSV is skipped by default. Enable it with:
 
 ## Dendrogram Figures
 
-SFUMATO saves two types of dendrogram figures.
+**Shared multiresolution dendrogram** (`*_multiresolution_dendrogram_allK.png`):
 
-The shared multiresolution dendrogram:
+- shared oversampled-component dendrogram
+- branches coloured across resolutions
+- one dashed cut line per K
+- aligned colour strips at each K
 
-```text
-*_multiresolution_dendrogram_allK.png
-```
+**K-specific dendrogram** (`*_cut_dendrogram.png`):
 
-This figure shows:
-
-- the shared oversampled-component dendrogram;
-- branches coloured across resolutions;
-- one dashed horizontal cut line per K;
-- aligned colour strips showing cluster colours at each K.
-
-The K-specific dendrogram:
-
-```text
-*_cut_dendrogram.png
-```
-
-This figure shows:
-
-- the same shared dendrogram;
-- branches coloured according to the selected K;
-- one dashed cut line;
-- one colour strip for that K.
-
-These figures are useful for checking that colour assignment is consistent across resolutions.
+- same shared dendrogram
+- branches coloured for the selected K
+- one dashed cut line and one colour strip
 
 ## Optional UMAP Figures
 
-UMAP post-processing:
-
 ```bash
-python plot_embedding_umap.py --config configs/mousexeniumniche.json
-```
-
-For one K only:
-
-```bash
-python plot_embedding_umap.py --config configs/mousexeniumniche.json --k 30
+python plots_umap/plot_embedding_umap.py --config configs/mousexeniumniche.json
+python plots_umap/plot_embedding_umap.py --config configs/mousexeniumniche.json --k 30
 ```
 
 ## Optional Embedding-Dimension Figures
 
-Plot the first embedding dimensions directly:
-
 ```bash
-python plot_embedding_dims.py --config configs/mousexeniumniche.json --k 30
+python plots_umap/plot_embedding_dims.py --config configs/mousexeniumniche.json --k 30
 ```
 
-This is useful for checking whether the SVD representation already contains clear structure before UMAP.
+## Mask Generation
+
+`make_masks/` contains scripts to generate semantic spatial masks from the bin-level posterior outputs. These were used for the paper analyses and require additional dependencies (`opencv-python`).
+
+## Alvis / SLURM
+
+```bash
+bash sbatch/submit_pipeline.sh
+```
 
 ## Notes
 

@@ -337,7 +337,7 @@ python plots_umap/plot_embedding_dims.py --config configs/mousexeniumniche.json 
 
 `make_masks/` contains scripts to generate semantic spatial masks from the bin-level posterior outputs. These were used for the paper analyses and require additional dependencies (`opencv-python`).
 
-## Alvis / SLURM
+## HPC / SLURM
 
 ```bash
 bash sbatch/submit_pipeline.sh
@@ -350,3 +350,16 @@ bash sbatch/submit_pipeline.sh
 - All requested K values are obtained by cutting the same shared dendrogram.
 - Cluster colours are assigned from the shared dendrogram ordering, not from a separate PCA of final centroids.
 - Colour differences should be interpreted as following the shared hierarchical ordering, not as exact metric distances in expression space.
+
+## Authors
+
+Alessia Giustolisi\*, Christophe Avenel\*†, Carolina Wählby\*†
+
+\* Department of Information Technology, Uppsala University, Uppsala, Sweden  
+† BioImage Informatics Facility, Science for Life Laboratory (SciLifeLab), Sweden
+
+**Contact person for this repo:** alessia.giustolisi@it.uu.se
+
+## Citation
+
+Coming soon

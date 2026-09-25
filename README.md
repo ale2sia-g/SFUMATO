@@ -358,8 +358,6 @@ Alessia Giustolisi\*, Christophe Avenel\*†, Carolina Wählby\*†
 \* Department of Information Technology, Uppsala University, Uppsala, Sweden  
 † BioImage Informatics Facility, Science for Life Laboratory (SciLifeLab), Sweden
 
-Contact me: alessia.giustolisi@it.uu.se
-
 **Contact person for this repo:** alessia.giustolisi@it.uu.se
 
 ## Citation
